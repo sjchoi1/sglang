@@ -12,6 +12,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
+from sglang.srt.speculative.tile_aware import Calibration, PiecewiseLinearLatency
 from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 
 if is_cuda():
@@ -46,6 +47,19 @@ class StandaloneWorker(EAGLEWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+
+        # Tile-aware dynamic speculation
+        self.enable_tile_aware = getattr(server_args, 'speculative_tile_aware', False)
+        if self.enable_tile_aware:
+            self.calibration = Calibration()
+            self.latency_model = PiecewiseLinearLatency()
+            if getattr(server_args, 'speculative_calibration_path', None):
+                self.calibration.load(server_args.speculative_calibration_path)
+            if getattr(server_args, 'speculative_latency_path', None):
+                self.latency_model.load(server_args.speculative_latency_path)
+        else:
+            self.calibration = None
+            self.latency_model = None
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len

@@ -28,9 +28,11 @@ sglang/
 ├── python/sglang/srt/          # Core runtime
 │   ├── speculative/            # Speculative decoding implementations
 │   │   ├── eagle_worker.py     # EAGLE/EAGLE3 speculative worker
+│   │   ├── standalone_worker.py # Draft LM-based speculative worker
+│   │   ├── ngram_worker.py     # NGRAM speculative worker
 │   │   ├── eagle_utils.py      # Tree building, verification kernels
-│   │   ├── tile_aware.py       # Tile-aware dynamic speculation (NEW)
-│   │   └── profile_tile_aware.py # Profiling script (NEW)
+│   │   ├── tile_aware.py       # Tile-aware dynamic speculation
+│   │   └── profile_tile_aware.py # Profiling script
 │   ├── managers/
 │   │   └── schedule_batch.py   # Batch management, ScheduleBatch class
 │   ├── layers/sampler.py       # Sampling logic
@@ -92,27 +94,58 @@ GPU MLPs have tile boundaries (e.g., 64, 128, 256 tokens) where latency jumps. F
 E[accepted_tokens + bonus_tokens] / Latency(prefill + draft_tokens)
 ```
 
+### Supported Algorithms
+
+Tile-aware optimization works with all three speculative decoding algorithms:
+
+| Algorithm | Worker | Tile-Aware Approach |
+|-----------|--------|---------------------|
+| **EAGLE/EAGLE3** | `eagle_worker.py` | Dynamic per-batch k selection using calibrated scores |
+| **STANDALONE** (Draft LM) | `standalone_worker.py` | Same as EAGLE (inherits from EAGLEWorker) |
+| **NGRAM** | `ngram_worker.py` | Static k adjustment to tile boundary at init |
+
 ### Algorithm Overview
 
-1. **Calibration**: Map cumulative draft confidence scores to acceptance probabilities
+1. **Calibration** (EAGLE/STANDALONE only): Map cumulative draft confidence scores to acceptance probabilities
    - Histogram binning (50 bins by default)
    - Fitted offline from (score, accepted) pairs
 
-2. **Latency Model**: Piecewise linear with automatic boundary detection
+2. **Latency Model** (all algorithms): Piecewise linear with automatic boundary detection
    - Detects tile boundaries via 15% latency jumps
    - Fits linear regression per segment
 
 3. **Optimal k Selection**:
-   - Calibrate draft scores → acceptance probabilities
-   - Sort globally by probability (descending)
-   - Compute cumulative expected accepted tokens
-   - Search only tile boundaries (O(5) not O(N)) to find best E/L ratio
+   - **EAGLE/STANDALONE**: Per-batch dynamic selection
+     - Calibrate draft scores → acceptance probabilities
+     - Sort globally by probability (descending)
+     - Compute cumulative expected accepted tokens
+     - Search only tile boundaries (O(5) not O(N)) to find best E/L ratio
+   - **NGRAM**: Static adjustment at init
+     - Snap `draft_token_num` to nearest tile boundary
+
+### Calibration Dataset Considerations
+
+**Does the calibration dataset matter?** Yes, but moderately:
+
+1. **What affects calibration**:
+   - The draft-target model pair (same pair = same calibration)
+   - Domain distribution (code vs chat vs reasoning)
+   - Prompt length distribution
+
+2. **Practical recommendations**:
+   - Use a diverse dataset (mix of domains) for robustness
+   - Or calibrate per-domain if workloads are distinct
+   - The latency model is domain-agnostic (GPU hardware dependent)
+
+3. **When to recalibrate**:
+   - Changing draft or target model
+   - Significant shift in workload distribution
 
 ### Files
 
 - `tile_aware.py`: Core algorithm
-  - `Calibration`: Score → probability mapping
-  - `PiecewiseLinearLatency`: Boundary detection + linear regression
+  - `Calibration`: Score → probability mapping (EAGLE/STANDALONE)
+  - `PiecewiseLinearLatency`: Boundary detection + linear regression (all)
   - `compute_optimal_k()`: Finds optimal draft token count
 
 - `profile_tile_aware.py`: Offline profiling script
@@ -124,13 +157,13 @@ E[accepted_tokens + bonus_tokens] / Latency(prefill + draft_tokens)
 
 ```bash
 --speculative-tile-aware              # Enable feature
---speculative-calibration-path PATH   # Path to calibration.npz
---speculative-latency-path PATH       # Path to latency_model.npz
+--speculative-calibration-path PATH   # Path to calibration.npz (EAGLE/STANDALONE)
+--speculative-latency-path PATH       # Path to latency_model.npz (all algorithms)
 ```
 
 ### Integration Points
 
-In `eagle_worker.py`:
+**EAGLE/STANDALONE** (`eagle_worker.py`, `standalone_worker.py`):
 ```python
 # In draft_forward(), after generating draft scores:
 if self.enable_tile_aware:
@@ -141,6 +174,16 @@ if self.enable_tile_aware:
         prefill_tokens=0,
         max_k=self.speculative_num_draft_tokens,
     )
+```
+
+**NGRAM** (`ngram_worker.py`):
+```python
+# At init, snap draft_token_num to tile boundary:
+if self.enable_tile_aware and self.latency_model:
+    boundaries = self.latency_model.get_boundaries()
+    valid = [b for b in boundaries if b <= self.draft_token_num]
+    if valid:
+        self.draft_token_num = max(valid)
 ```
 
 ## CUDA Kernels
