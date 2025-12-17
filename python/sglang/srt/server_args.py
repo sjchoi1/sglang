@@ -436,6 +436,11 @@ class ServerArgs:
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
 
+    # Speculative decoding (tile-aware dynamic speculation)
+    speculative_tile_aware: bool = False
+    speculative_calibration_path: Optional[str] = None
+    speculative_latency_path: Optional[str] = None
+
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -3457,6 +3462,26 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
+        )
+
+        # Speculative decoding (tile-aware)
+        parser.add_argument(
+            "--speculative-tile-aware",
+            action="store_true",
+            default=ServerArgs.speculative_tile_aware,
+            help="Enable tile-aware dynamic speculation that optimizes draft token count based on GPU tile boundaries and acceptance probability.",
+        )
+        parser.add_argument(
+            "--speculative-calibration-path",
+            type=str,
+            default=ServerArgs.speculative_calibration_path,
+            help="Path to calibration model (.npz) for tile-aware speculation.",
+        )
+        parser.add_argument(
+            "--speculative-latency-path",
+            type=str,
+            default=ServerArgs.speculative_latency_path,
+            help="Path to latency model (.npz) for tile-aware speculation.",
         )
 
         # Expert parallelism

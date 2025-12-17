@@ -46,6 +46,11 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
+from sglang.srt.speculative.tile_aware import (
+    Calibration,
+    PiecewiseLinearLatency,
+    compute_optimal_k,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
@@ -101,6 +106,19 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+
+        # Tile-aware dynamic speculation
+        self.enable_tile_aware = getattr(server_args, 'speculative_tile_aware', False)
+        if self.enable_tile_aware:
+            self.calibration = Calibration()
+            self.latency_model = PiecewiseLinearLatency()
+            if getattr(server_args, 'speculative_calibration_path', None):
+                self.calibration.load(server_args.speculative_calibration_path)
+            if getattr(server_args, 'speculative_latency_path', None):
+                self.latency_model.load(server_args.speculative_latency_path)
+        else:
+            self.calibration = None
+            self.latency_model = None
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -536,6 +554,7 @@ class EAGLEWorker(TpModelWorker):
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
             )
+            num_draft_tokens = self.speculative_num_draft_tokens
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if (
@@ -545,7 +564,7 @@ class EAGLEWorker(TpModelWorker):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
-            parent_list, top_scores_index, draft_tokens = self.draft_forward(
+            parent_list, top_scores_index, draft_tokens, num_draft_tokens = self.draft_forward(
                 forward_batch
             )
 
@@ -553,7 +572,7 @@ class EAGLEWorker(TpModelWorker):
             return EagleVerifyInput.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
-                self.speculative_num_draft_tokens,
+                num_draft_tokens,
             )
 
         (
@@ -572,7 +591,7 @@ class EAGLEWorker(TpModelWorker):
             batch.seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
-            self.speculative_num_draft_tokens,
+            num_draft_tokens,
         )
 
         return EagleVerifyInput(
@@ -585,7 +604,7 @@ class EAGLEWorker(TpModelWorker):
             retrive_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
-            draft_token_num=self.server_args.speculative_num_draft_tokens,
+            draft_token_num=num_draft_tokens,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
@@ -657,11 +676,25 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
+        # Compute optimal k (tile-aware or fixed)
+        if self.enable_tile_aware and self.calibration and self.latency_model:
+            # Concatenate scores for optimization
+            scores_cat = torch.cat(score_list, dim=1).flatten(1)
+            num_draft_tokens = compute_optimal_k(
+                scores_cat,
+                self.calibration,
+                self.latency_model,
+                prefill_tokens=0,  # TODO: pass from batch for mixed batches
+                max_k=self.speculative_num_draft_tokens,
+            )
+        else:
+            num_draft_tokens = self.speculative_num_draft_tokens
+
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
+            score_list, token_list, parents_list, num_draft_tokens
         )
 
-        return parent_list, top_scores_index, draft_tokens
+        return parent_list, top_scores_index, draft_tokens, num_draft_tokens
 
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker
