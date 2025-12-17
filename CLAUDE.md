@@ -102,7 +102,7 @@ Tile-aware optimization works with all three speculative decoding algorithms:
 |-----------|--------|---------------------|
 | **EAGLE/EAGLE3** | `eagle_worker.py` | Dynamic per-batch k selection using calibrated scores |
 | **STANDALONE** (Draft LM) | `standalone_worker.py` | Same as EAGLE (inherits from EAGLEWorker) |
-| **NGRAM** | `ngram_worker.py` | Static k adjustment to tile boundary at init |
+| **NGRAM** | `ngram_worker.py` | TODO: expose norm_freq from C++ for dynamic selection |
 
 ### Algorithm Overview
 
@@ -178,12 +178,11 @@ if self.enable_tile_aware:
 
 **NGRAM** (`ngram_worker.py`):
 ```python
-# At init, snap draft_token_num to tile boundary:
-if self.enable_tile_aware and self.latency_model:
-    boundaries = self.latency_model.get_boundaries()
-    valid = [b for b in boundaries if b <= self.draft_token_num]
-    if valid:
-        self.draft_token_num = max(valid)
+# TODO: NGRAM has internal norm_freq scores in C++ (ngram.cpp matchProb)
+# but they're not exposed to Python. To enable dynamic tile-aware:
+# 1. Modify Result struct to include std::vector<float> scores
+# 2. Return norm_freq alongside tokens
+# 3. Use calibration like EAGLE
 ```
 
 ## CUDA Kernels

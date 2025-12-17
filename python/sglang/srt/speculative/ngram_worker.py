@@ -16,7 +16,6 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.tile_aware import PiecewiseLinearLatency
 
 logger = logging.getLogger(__name__)
 
@@ -48,25 +47,13 @@ class NGRAMWorker:
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
 
-        # Tile-aware: adjust draft_token_num to tile boundary at init
+        # Tile-aware: TODO - requires exposing norm_freq from C++ ngram cache
+        # Currently NGRAM scores (frequencies) are computed but not returned
         self.enable_tile_aware = getattr(server_args, 'speculative_tile_aware', False)
         if self.enable_tile_aware:
-            self.latency_model = PiecewiseLinearLatency()
-            if getattr(server_args, 'speculative_latency_path', None):
-                self.latency_model.load(server_args.speculative_latency_path)
-                # Pick best k from tile boundaries (static optimization)
-                boundaries = self.latency_model.get_boundaries()
-                if boundaries:
-                    # Find closest tile boundary <= draft_token_num
-                    valid = [b for b in boundaries if b <= self.draft_token_num]
-                    if valid:
-                        old_k = self.draft_token_num
-                        self.draft_token_num = max(valid)
-                        logger.info(
-                            f"Tile-aware NGRAM: adjusted draft_token_num {old_k} -> {self.draft_token_num}"
-                        )
-        else:
-            self.latency_model = None
+            logger.warning(
+                "Tile-aware NGRAM not fully implemented: C++ ngram cache needs to expose norm_freq scores"
+            )
 
         self._init_preallocated_tensors()
 
