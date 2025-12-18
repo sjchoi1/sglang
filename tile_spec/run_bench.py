@@ -167,6 +167,19 @@ DATASETS = {
 }
 
 
+def format_chat(messages: List[dict]) -> str:
+    """Format conversation as Llama-style chat string."""
+    parts = []
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+        if role == "user":
+            parts.append(f"[INST] {content} [/INST]")
+        elif role == "assistant":
+            parts.append(f"{content}")
+    return " ".join(parts)
+
+
 def run_dataset(engine, samples: List[dict], name: str) -> Result:
     """Run benchmark on dataset. No max_new_tokens - natural EOS."""
     total_tokens = 0
@@ -175,13 +188,15 @@ def run_dataset(engine, samples: List[dict], name: str) -> Result:
 
     for sample in samples:
         if "turns" in sample:
-            # Multi-turn (MT-bench)
-            conv = []
+            # Multi-turn (MT-bench) - format as chat string
+            messages = []
             for turn in sample["turns"]:
-                conv.append({"role": "user", "content": turn})
+                messages.append({"role": "user", "content": turn})
+                prompt = format_chat(messages)
+
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                result = engine.generate(conv, sampling_params={"temperature": 0})
+                result = engine.generate(prompt, sampling_params={"temperature": 0})
                 torch.cuda.synchronize()
                 total_time += time.perf_counter() - t0
 
@@ -189,7 +204,7 @@ def run_dataset(engine, samples: List[dict], name: str) -> Result:
                 total_tokens += meta.get("completion_tokens", len(result.get("text", "").split()))
                 if meta.get("spec_accept_length", 0) > 0:
                     accept_lengths.append(meta["spec_accept_length"])
-                conv.append({"role": "assistant", "content": result.get("text", "")})
+                messages.append({"role": "assistant", "content": result.get("text", "")})
         else:
             # Single turn
             torch.cuda.synchronize()
