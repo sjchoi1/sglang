@@ -268,14 +268,21 @@ class Engine(EngineBase):
         """Run warmup requests for tile-spec profiling if needed."""
         if not getattr(self.server_args, 'tile_spec', False):
             return
+
+        import time
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Small delay to let scheduler initialize
+        time.sleep(1.0)
+
         if self.tile_spec_ready():
-            return  # Already profiled (loaded from cache)
+            logger.info("TileSpec: Already profiled (loaded from cache)")
+            return
 
         from sglang.srt.speculative.tile_spec.profiler import _load_prompts, get_cache_dir
         import torch
-        import logging
 
-        logger = logging.getLogger(__name__)
         logger.info("TileSpec: Running warmup profiling...")
 
         # Load prompts for warmup

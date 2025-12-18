@@ -2373,15 +2373,18 @@ class Scheduler(
             )
 
         # Tile-spec profiler status
-        if hasattr(self, "draft_worker") and self.draft_worker is not None:
+        tile_spec_enabled = getattr(self.server_args, 'tile_spec', False)
+        if not tile_spec_enabled:
+            ret["tile_spec_ready"] = True  # Not enabled = always ready
+        elif hasattr(self, "draft_worker") and self.draft_worker is not None:
             profiler = getattr(self.draft_worker, "tile_spec_profiler", None)
             if profiler is not None:
-                # Ready when latency model exists (calibration can continue in background)
+                # Ready when latency model exists
                 ret["tile_spec_ready"] = profiler.latency_model is not None
             else:
-                ret["tile_spec_ready"] = True  # No profiler = ready
+                ret["tile_spec_ready"] = False  # Profiler not created yet
         else:
-            ret["tile_spec_ready"] = True  # No draft worker = ready
+            ret["tile_spec_ready"] = False  # Draft worker not ready yet
 
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
