@@ -10,9 +10,15 @@ from sglang.srt.speculative.tile_spec.core import (
     PiecewiseLinearLatency,
     compute_optimal_k,
 )
+from sglang.srt.speculative.tile_spec.profiler import (
+    TileSpecProfiler,
+    get_cache_dir,
+)
 
 __all__ = [
     "Calibration",
     "PiecewiseLinearLatency",
     "compute_optimal_k",
+    "TileSpecProfiler",
+    "get_cache_dir",
 ]

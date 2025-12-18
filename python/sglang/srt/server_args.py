@@ -436,10 +436,8 @@ class ServerArgs:
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
 
-    # Speculative decoding (tile-aware dynamic speculation)
-    speculative_tile_aware: bool = False
-    speculative_calibration_path: Optional[str] = None
-    speculative_latency_path: Optional[str] = None
+    # Tile-spec: automatic tile-aware speculation optimization
+    tile_spec: bool = False
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -3464,24 +3462,12 @@ class ServerArgs:
             help="The cache capacity for ngram speculative decoding.",
         )
 
-        # Speculative decoding (tile-aware)
+        # Tile-spec: automatic tile-aware speculation optimization
         parser.add_argument(
-            "--speculative-tile-aware",
+            "--tile-spec",
             action="store_true",
-            default=ServerArgs.speculative_tile_aware,
-            help="Enable tile-aware dynamic speculation that optimizes draft token count based on GPU tile boundaries and acceptance probability.",
-        )
-        parser.add_argument(
-            "--speculative-calibration-path",
-            type=str,
-            default=ServerArgs.speculative_calibration_path,
-            help="Path to calibration model (.npz) for tile-aware speculation.",
-        )
-        parser.add_argument(
-            "--speculative-latency-path",
-            type=str,
-            default=ServerArgs.speculative_latency_path,
-            help="Path to latency model (.npz) for tile-aware speculation.",
+            default=ServerArgs.tile_spec,
+            help="Enable tile-spec optimization for speculative decoding. Auto-profiles latency and calibrates using ShareGPT on first run, caches results in tile_spec/cache/.",
         )
 
         # Expert parallelism

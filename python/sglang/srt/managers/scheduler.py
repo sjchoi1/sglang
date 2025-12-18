@@ -358,6 +358,10 @@ class Scheduler(
             **draft_worker_kwargs
         )
 
+        # Initialize tile-spec profiling if enabled
+        if server_args.tile_spec and hasattr(self.draft_worker, 'init_tile_spec'):
+            self.draft_worker.init_tile_spec()
+
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker

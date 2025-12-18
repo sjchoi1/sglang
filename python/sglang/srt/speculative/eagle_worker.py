@@ -49,6 +49,7 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.tile_spec import (
     Calibration,
     PiecewiseLinearLatency,
+    TileSpecProfiler,
     compute_optimal_k,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -77,13 +78,8 @@ _is_npu = is_npu()
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
 
-import atexit
-import os
-
 logger = logging.getLogger(__name__)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
-SGLANG_TILE_SPEC_CALIBRATE = get_bool_env_var("SGLANG_TILE_SPEC_CALIBRATE")
-SGLANG_TILE_SPEC_CALIBRATE_PATH = os.environ.get("SGLANG_TILE_SPEC_CALIBRATE_PATH", "calibration_raw.npz")
 
 
 class EAGLEWorker(TpModelWorker):
@@ -112,25 +108,12 @@ class EAGLEWorker(TpModelWorker):
             server_args.speculative_algorithm
         )
 
-        # Tile-aware dynamic speculation
-        self.enable_tile_aware = getattr(server_args, 'speculative_tile_aware', False)
-        if self.enable_tile_aware:
-            self.calibration = Calibration()
-            self.latency_model = PiecewiseLinearLatency()
-            if getattr(server_args, 'speculative_calibration_path', None):
-                self.calibration.load(server_args.speculative_calibration_path)
-            if getattr(server_args, 'speculative_latency_path', None):
-                self.latency_model.load(server_args.speculative_latency_path)
-        else:
-            self.calibration = None
-            self.latency_model = None
-
-        # Tile-spec calibration data collection
-        self._calibrate_scores = None  # Temp storage for scores between draft and verify
-        self._calibrate_data = [] if SGLANG_TILE_SPEC_CALIBRATE else None
-        if SGLANG_TILE_SPEC_CALIBRATE:
-            atexit.register(self._save_calibration_on_exit)
-            logger.info(f"Tile-spec calibration enabled, will save to {SGLANG_TILE_SPEC_CALIBRATE_PATH}")
+        # Tile-spec: automatic tile-aware speculation optimization
+        self.enable_tile_spec = getattr(server_args, 'tile_spec', False)
+        self.tile_spec_profiler = None
+        self.calibration = None
+        self.latency_model = None
+        # Profiling will be done after init via init_tile_spec() called by scheduler
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -688,8 +671,8 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-        # Compute optimal k (tile-aware or fixed)
-        if self.enable_tile_aware and self.calibration and self.latency_model:
+        # Compute optimal k (tile-spec or fixed)
+        if self.enable_tile_spec and self.calibration and self.latency_model:
             # Concatenate scores for optimization
             scores_cat = torch.cat(score_list, dim=1).flatten(1)
             num_draft_tokens = compute_optimal_k(
@@ -705,11 +688,6 @@ class EAGLEWorker(TpModelWorker):
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, num_draft_tokens
         )
-
-        # Save scores for calibration (if enabled)
-        if self._calibrate_data is not None:
-            scores_cat = torch.cat(score_list, dim=1).flatten(1)
-            self._calibrate_scores = scores_cat.gather(1, top_scores_index).cpu()
 
         return parent_list, top_scores_index, draft_tokens, num_draft_tokens
 
@@ -805,10 +783,6 @@ class EAGLEWorker(TpModelWorker):
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
         batch.spec_info = res.draft_input
-
-        # Collect calibration data (if enabled)
-        if self._calibrate_data is not None and self._calibrate_scores is not None:
-            self._collect_calibration_data(res.accept_length_per_req_cpu)
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
@@ -1121,35 +1095,25 @@ class EAGLEWorker(TpModelWorker):
         )
         return success, message
 
-    def _collect_calibration_data(self, accept_length_per_req: List[int]):
-        """Collect (score, accepted) pairs for tile-spec calibration."""
-        scores = self._calibrate_scores  # (bs, num_draft_tokens-1)
-        bs, num_draft = scores.shape
+    def init_tile_spec(self):
+        """Initialize tile-spec profiling. Called after full worker initialization."""
+        if not self.enable_tile_spec:
+            return
 
-        for i, accept_len in enumerate(accept_length_per_req):
-            for j in range(num_draft):
-                score = scores[i, j].item()
-                accepted = 1.0 if j < accept_len else 0.0
-                self._calibrate_data.append((score, accepted))
+        logger.info("Initializing tile-spec profiling...")
+        self.tile_spec_profiler = TileSpecProfiler(self.server_args)
 
-        self._calibrate_scores = None  # Clear
+        # Run profiling (latency + calibration)
+        self.latency_model, self.calibration = self.tile_spec_profiler.run_profiling(
+            target_worker=self.target_worker,
+            draft_worker=self,
+            tokenizer=None,  # TODO: pass tokenizer for ShareGPT calibration
+        )
 
-        # Auto-save every 10000 samples
-        if len(self._calibrate_data) % 10000 == 0:
-            self.save_calibration_data(SGLANG_TILE_SPEC_CALIBRATE_PATH)
-
-    def save_calibration_data(self, path: str):
-        """Save collected calibration data to file."""
-        if self._calibrate_data:
-            import numpy as np
-            data = np.array(self._calibrate_data, dtype=np.float32)
-            np.savez(path, scores=data[:, 0], accepted=data[:, 1])
-            logger.info(f"Saved {len(self._calibrate_data)} calibration samples to {path}")
-
-    def _save_calibration_on_exit(self):
-        """Save calibration data on process exit."""
-        if self._calibrate_data:
-            self.save_calibration_data(SGLANG_TILE_SPEC_CALIBRATE_PATH)
+        if self.latency_model:
+            logger.info(f"Tile-spec enabled with boundaries: {self.latency_model.get_boundaries()}")
+        else:
+            logger.warning("Tile-spec latency model not loaded, optimization disabled")
 
 
 @torch.compile(dynamic=True, disable=_is_npu)

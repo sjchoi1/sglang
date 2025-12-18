@@ -47,12 +47,12 @@ class NGRAMWorker:
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
 
-        # Tile-aware: TODO - requires exposing norm_freq from C++ ngram cache
+        # Tile-spec: TODO - requires exposing norm_freq from C++ ngram cache
         # Currently NGRAM scores (frequencies) are computed but not returned
-        self.enable_tile_aware = getattr(server_args, 'speculative_tile_aware', False)
-        if self.enable_tile_aware:
+        self.enable_tile_spec = getattr(server_args, 'tile_spec', False)
+        if self.enable_tile_spec:
             logger.warning(
-                "Tile-aware NGRAM not fully implemented: C++ ngram cache needs to expose norm_freq scores"
+                "Tile-spec for NGRAM not fully implemented: C++ ngram cache needs to expose norm_freq scores"
             )
 
         self._init_preallocated_tensors()
