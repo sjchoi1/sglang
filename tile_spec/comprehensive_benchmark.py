@@ -1,342 +1,224 @@
 #!/usr/bin/env python3
 """
-Comprehensive Tile-Spec Benchmark.
+Tile-Spec Benchmark.
 
-Compares AR, Eagle3, Eagle3+TileSpec across batch sizes with exact batch control.
-Uses Engine restart between configurations for isolated measurements.
+Compares AR, Eagle3, Eagle3+TileSpec with batch size cap.
+Methodology: Run entire dataset with max_running_requests as batch cap.
+Natural EOS, temp=0 for deterministic comparison.
 
 Usage:
-    python tile_spec/comprehensive_benchmark.py --batch-sizes 1 2 4 8 16 32 --num-prompts 80
+    python tile_spec/comprehensive_benchmark.py --batch-sizes 1 2 4 8 16 32 64
 """
 
 import argparse
 import gc
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
 
 
 @dataclass
-class BenchmarkConfig:
-    """Configuration for a single benchmark run."""
+class Config:
+    """Benchmark configuration."""
     name: str
     speculative_algorithm: Optional[str] = None
-    speculative_draft_model_path: Optional[str] = None
-    speculative_num_steps: int = 5
-    speculative_eagle_topk: int = 8
-    speculative_num_draft_tokens: int = 64
+    draft_model_path: Optional[str] = None
     tile_spec: bool = False
 
 
 @dataclass
-class BenchmarkResult:
-    """Results from a single benchmark run."""
-    config_name: str
+class Result:
+    """Benchmark result."""
+    config: str
     batch_size: int
     num_prompts: int
-    total_time_s: float
-    total_output_tokens: int
-    throughput_tok_s: float
+    total_tokens: int
+    time_s: float
+    throughput: float
     acceptance_length: float
-    num_verify_calls: int
+    speedup: float = 1.0
 
 
-def get_mtbench_prompts(num_prompts: int = 80) -> List[str]:
-    """Load MT-bench prompts (first turn only for simplicity)."""
-    mtbench_path = Path(__file__).parent.parent / "benchmark" / "mtbench" / "question.jsonl"
-
-    if not mtbench_path.exists():
-        # Fall back to simple prompts
-        print(f"MT-bench not found at {mtbench_path}, using synthetic prompts")
-        return [
-            f"Explain the concept of {topic} in simple terms."
-            for topic in [
-                "machine learning", "quantum computing", "climate change",
-                "blockchain", "artificial intelligence", "neural networks",
-                "data science", "cybersecurity", "cloud computing", "IoT"
-            ] * (num_prompts // 10 + 1)
-        ][:num_prompts]
+def load_prompts(path: Path, limit: int) -> List[str]:
+    """Load prompts from MT-bench or similar JSONL."""
+    if not path.exists():
+        print(f"Dataset not found: {path}")
+        # Fallback synthetic prompts
+        topics = ["AI", "physics", "history", "coding", "math", "biology"]
+        return [f"Explain {t} in detail." for t in topics * (limit // 6 + 1)][:limit]
 
     prompts = []
-    with open(mtbench_path, "r") as f:
+    with open(path) as f:
         for line in f:
-            if len(prompts) >= num_prompts:
-                break
             obj = json.loads(line)
-            # Use first turn only
+            # Handle MT-bench format
             if "turns" in obj:
                 prompts.append(obj["turns"][0])
             elif "prompt" in obj:
-                prompts.append(obj["prompt"][0] if isinstance(obj["prompt"], list) else obj["prompt"])
+                p = obj["prompt"]
+                prompts.append(p[0] if isinstance(p, list) else p)
+            if len(prompts) >= limit:
+                break
 
-    print(f"Loaded {len(prompts)} MT-bench prompts")
+    print(f"Loaded {len(prompts)} prompts from {path.name}")
     return prompts
 
 
-def run_benchmark(
-    config: BenchmarkConfig,
+def run(
+    config: Config,
     prompts: List[str],
     batch_size: int,
     model_path: str,
-    max_new_tokens: int = 256,
-    warmup_prompts: int = 5,
-) -> BenchmarkResult:
-    """Run benchmark with specific configuration and batch size."""
+    draft_path: str,
+) -> Result:
+    """Run benchmark: entire dataset with batch cap."""
     import sglang as sgl
 
-    # Build engine kwargs
-    engine_kwargs = {
+    # Engine config
+    kwargs = {
         "model_path": model_path,
         "dtype": "float16",
-        "max_running_requests": batch_size,  # Control batch size
+        "max_running_requests": batch_size,
     }
 
     if config.speculative_algorithm:
-        engine_kwargs["speculative_algorithm"] = config.speculative_algorithm
-        engine_kwargs["speculative_draft_model_path"] = config.speculative_draft_model_path
-        engine_kwargs["speculative_num_steps"] = config.speculative_num_steps
-        engine_kwargs["speculative_eagle_topk"] = config.speculative_eagle_topk
-        engine_kwargs["speculative_num_draft_tokens"] = config.speculative_num_draft_tokens
+        kwargs.update({
+            "speculative_algorithm": config.speculative_algorithm,
+            "speculative_draft_model_path": config.draft_model_path or draft_path,
+            "speculative_num_steps": 5,
+            "speculative_eagle_topk": 8,
+            "speculative_num_draft_tokens": 64,
+        })
 
     if config.tile_spec:
-        engine_kwargs["tile_spec"] = True
+        kwargs["tile_spec"] = True
 
-    print(f"\n{'='*60}")
-    print(f"Config: {config.name}, Batch Size: {batch_size}")
-    print(f"{'='*60}")
+    print(f"\n[{config.name}] batch_cap={batch_size}, prompts={len(prompts)}")
 
-    # Create engine
-    engine = sgl.Engine(**engine_kwargs)
+    engine = sgl.Engine(**kwargs)
 
-    # Warmup (also triggers profiling for tile-spec)
-    print(f"Warmup with {warmup_prompts} prompts...")
-    warmup_batch = [prompts[i % len(prompts)] for i in range(warmup_prompts)]
-    engine.generate(warmup_batch, sampling_params={"max_new_tokens": 32})
+    # Warmup
+    engine.generate(prompts[:5], sampling_params={"temperature": 0, "max_new_tokens": 64})
 
-    # If tile-spec, do additional warmup to complete profiling
+    # Extra warmup for tile-spec profiling
     if config.tile_spec:
-        print("Additional warmup for tile-spec profiling (100 requests)...")
-        for i in range(0, 100, batch_size):
-            chunk_size = min(batch_size, 100 - i)
-            chunk = [prompts[j % len(prompts)] for j in range(i, i + chunk_size)]
-            engine.generate(chunk, sampling_params={"max_new_tokens": 32})
+        for i in range(0, 100, max(batch_size, 10)):
+            engine.generate(
+                prompts[:min(batch_size, len(prompts))],
+                sampling_params={"temperature": 0, "max_new_tokens": 64}
+            )
 
-    # Select prompts for this batch size (cycle if needed)
-    num_prompts = len(prompts)
-    batch_prompts = [prompts[i % num_prompts] for i in range(batch_size)]
-
-    # Run benchmark - send batch_size prompts as a single batch
-    print(f"Running batch of {batch_size} prompts...")
-
+    # Benchmark: run entire dataset
     torch.cuda.synchronize()
-    start_time = time.perf_counter()
+    t0 = time.perf_counter()
 
-    # Generate as a batch (list of prompts)
     results = engine.generate(
-        batch_prompts,
-        sampling_params={"max_new_tokens": max_new_tokens}
+        prompts,
+        sampling_params={"temperature": 0}  # No max_new_tokens cap - natural EOS
     )
 
     torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start_time
+    elapsed = time.perf_counter() - t0
 
-    # Handle results (can be a single dict if batch=1, or list if batch>1)
+    # Collect metrics
     if not isinstance(results, list):
         results = [results]
 
-    # Collect metrics
-    total_output_tokens = 0
-    num_verify_calls = 0
-    total_accept_length = 0.0
-    num_with_accept_length = 0
+    total_tokens = 0
+    total_accept_len = 0.0
+    n_spec = 0
 
-    for result in results:
-        # Get actual completion tokens from meta_info
-        meta = result.get("meta_info", {})
-        tokens = meta.get("completion_tokens", 0)
-        if tokens > 0:
-            total_output_tokens += tokens
-        else:
-            # Fallback: estimate from text
-            output_text = result.get("text", "")
-            total_output_tokens += len(output_text.split())
+    for r in results:
+        meta = r.get("meta_info", {})
+        total_tokens += meta.get("completion_tokens", len(r.get("text", "").split()))
 
-        # Get spec_verify_ct if available
-        if "spec_verify_ct" in meta and meta["spec_verify_ct"] > 0:
-            num_verify_calls += meta["spec_verify_ct"]
+        if meta.get("spec_accept_length", 0) > 0:
+            total_accept_len += meta["spec_accept_length"]
+            n_spec += 1
 
-        # Get pre-calculated acceptance length if available
-        if "spec_accept_length" in meta and meta["spec_accept_length"] > 0:
-            total_accept_length += meta["spec_accept_length"]
-            num_with_accept_length += 1
+    throughput = total_tokens / elapsed
+    accept_len = total_accept_len / n_spec if n_spec > 0 else 1.0
 
-    # Calculate metrics
-    throughput = total_output_tokens / elapsed if elapsed > 0 else 0
+    print(f"  {total_tokens} tokens in {elapsed:.1f}s = {throughput:.1f} tok/s, τ={accept_len:.2f}")
 
-    # Use pre-calculated acceptance length if available, otherwise calculate
-    if num_with_accept_length > 0:
-        acceptance_length = total_accept_length / num_with_accept_length
-    elif num_verify_calls > 0:
-        acceptance_length = total_output_tokens / num_verify_calls
-    else:
-        acceptance_length = 1.0  # AR baseline
-
-    print(f"  Time: {elapsed:.2f}s")
-    print(f"  Output tokens: {total_output_tokens}")
-    print(f"  Throughput: {throughput:.2f} tok/s")
-    print(f"  Verify calls: {num_verify_calls}")
-    print(f"  Acceptance length: {acceptance_length:.2f}")
-
-    # Cleanup
     engine.shutdown()
     del engine
     gc.collect()
     torch.cuda.empty_cache()
-    time.sleep(2)  # Allow GPU to settle
 
-    return BenchmarkResult(
-        config_name=config.name,
+    return Result(
+        config=config.name,
         batch_size=batch_size,
-        num_prompts=batch_size,
-        total_time_s=elapsed,
-        total_output_tokens=total_output_tokens,
-        throughput_tok_s=throughput,
-        acceptance_length=acceptance_length,
-        num_verify_calls=num_verify_calls,
+        num_prompts=len(prompts),
+        total_tokens=total_tokens,
+        time_s=elapsed,
+        throughput=throughput,
+        acceptance_length=accept_len,
     )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Comprehensive Tile-Spec Benchmark")
-    parser.add_argument(
-        "--model-path",
-        type=str,
-        default="meta-llama/Llama-3.1-8B-Instruct",
-        help="Target model path",
-    )
-    parser.add_argument(
-        "--draft-model-path",
-        type=str,
-        default="lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B",
-        help="Draft model path for EAGLE3",
-    )
-    parser.add_argument(
-        "--batch-sizes",
-        type=int,
-        nargs="+",
-        default=[1, 2, 4, 8, 16, 32],
-        help="Batch sizes to test",
-    )
-    parser.add_argument(
-        "--num-prompts",
-        type=int,
-        default=80,
-        help="Number of prompts to load from MT-bench",
-    )
-    parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=256,
-        help="Maximum new tokens per request",
-    )
-    parser.add_argument(
-        "--output-file",
-        type=str,
-        default="tile_spec/benchmark_results.json",
-        help="Output file for results",
-    )
-    parser.add_argument(
-        "--configs",
-        type=str,
-        nargs="+",
-        default=["AR", "Eagle3", "Eagle3+TileSpec"],
-        choices=["AR", "Eagle3", "Eagle3+TileSpec"],
-        help="Configurations to benchmark",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
+    parser.add_argument("--draft", default="lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B")
+    parser.add_argument("--dataset", default="benchmark/mtbench/question.jsonl")
+    parser.add_argument("--num-prompts", type=int, default=80)
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 8, 16, 32, 64])
+    parser.add_argument("--output", default="tile_spec/results.json")
+    parser.add_argument("--configs", nargs="+", default=["AR", "Eagle3", "Eagle3+TileSpec"])
     args = parser.parse_args()
 
-    # Define configurations
-    all_configs = {
-        "AR": BenchmarkConfig(name="AR"),
-        "Eagle3": BenchmarkConfig(
-            name="Eagle3",
-            speculative_algorithm="EAGLE3",
-            speculative_draft_model_path=args.draft_model_path,
-        ),
-        "Eagle3+TileSpec": BenchmarkConfig(
-            name="Eagle3+TileSpec",
-            speculative_algorithm="EAGLE3",
-            speculative_draft_model_path=args.draft_model_path,
-            tile_spec=True,
-        ),
+    # Configs
+    configs = {
+        "AR": Config("AR"),
+        "Eagle3": Config("Eagle3", "EAGLE3", args.draft),
+        "Eagle3+TileSpec": Config("Eagle3+TileSpec", "EAGLE3", args.draft, tile_spec=True),
     }
 
-    configs = [all_configs[name] for name in args.configs]
-
-    # Load prompts
-    prompts = get_mtbench_prompts(args.num_prompts)
+    prompts = load_prompts(Path(args.dataset), args.num_prompts)
+    results: List[Result] = []
 
     # Run benchmarks
-    all_results: List[BenchmarkResult] = []
+    for batch_size in args.batch_sizes:
+        ar_throughput = None
 
-    for config in configs:
-        for batch_size in args.batch_sizes:
+        for name in args.configs:
+            cfg = configs[name]
             try:
-                result = run_benchmark(
-                    config=config,
-                    prompts=prompts,
-                    batch_size=batch_size,
-                    model_path=args.model_path,
-                    max_new_tokens=args.max_new_tokens,
-                )
-                all_results.append(result)
+                r = run(cfg, prompts, batch_size, args.model, args.draft)
+
+                # Calculate speedup vs AR
+                if name == "AR":
+                    ar_throughput = r.throughput
+                    r.speedup = 1.0
+                elif ar_throughput:
+                    r.speedup = r.throughput / ar_throughput
+
+                results.append(r)
             except Exception as e:
-                print(f"Error running {config.name} with batch_size={batch_size}: {e}")
-                continue
+                print(f"  ERROR: {e}")
 
-    # Save results
-    output_path = Path(args.output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Save
+    Path(args.output).parent.mkdir(exist_ok=True)
+    with open(args.output, "w") as f:
+        json.dump({
+            "model": args.model,
+            "draft": args.draft,
+            "results": [asdict(r) for r in results]
+        }, f, indent=2)
 
-    results_dict = {
-        "metadata": {
-            "model_path": args.model_path,
-            "draft_model_path": args.draft_model_path,
-            "max_new_tokens": args.max_new_tokens,
-            "num_prompts": args.num_prompts,
-        },
-        "results": [
-            {
-                "config": r.config_name,
-                "batch_size": r.batch_size,
-                "num_prompts": r.num_prompts,
-                "total_time_s": r.total_time_s,
-                "total_output_tokens": r.total_output_tokens,
-                "throughput_tok_s": r.throughput_tok_s,
-                "acceptance_length": r.acceptance_length,
-                "num_verify_calls": r.num_verify_calls,
-            }
-            for r in all_results
-        ],
-    }
+    # Summary
+    print(f"\n{'='*70}")
+    print(f"{'Config':<20} {'Batch':<8} {'Throughput':<12} {'τ':<8} {'Speedup':<10}")
+    print("-" * 70)
+    for r in results:
+        print(f"{r.config:<20} {r.batch_size:<8} {r.throughput:<12.1f} {r.acceptance_length:<8.2f} {r.speedup:<10.2f}x")
 
-    with open(output_path, "w") as f:
-        json.dump(results_dict, f, indent=2)
-
-    print(f"\n{'='*60}")
-    print(f"Results saved to {output_path}")
-    print(f"{'='*60}")
-
-    # Print summary table
-    print("\n=== Summary ===")
-    print(f"{'Config':<20} {'Batch':<8} {'Throughput':<15} {'Accept Len':<12}")
-    print("-" * 60)
-    for r in all_results:
-        print(f"{r.config_name:<20} {r.batch_size:<8} {r.throughput_tok_s:<15.2f} {r.acceptance_length:<12.2f}")
+    print(f"\nSaved to {args.output}")
 
 
 if __name__ == "__main__":
