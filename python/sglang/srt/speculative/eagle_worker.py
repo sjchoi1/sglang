@@ -716,6 +716,12 @@ class EAGLEWorker(TpModelWorker):
                 spec_info.retrive_next_token.shape
             ).cpu()
 
+        # Tile-spec profiling: measure verification latency
+        _profile_start = None
+        if self.enable_tile_spec and self.tile_spec_profiler and self.tile_spec_profiler.is_profiling():
+            torch.cuda.synchronize()
+            _profile_start = time.perf_counter()
+
         # Forward
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
@@ -774,6 +780,20 @@ class EAGLEWorker(TpModelWorker):
 
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
+
+        # Tile-spec profiling: record latency and calibration data
+        if _profile_start is not None:
+            torch.cuda.synchronize()
+            latency_ms = (time.perf_counter() - _profile_start) * 1000
+            num_tokens = spec_info.draft_token_num * len(batch.seq_lens)
+            self.tile_spec_profiler.record_verification(
+                num_tokens=num_tokens,
+                latency_ms=latency_ms,
+                # TODO: add calibration data (scores, accepted) once we extract them
+            )
+            # Update models if profiling complete
+            if not self.tile_spec_profiler.is_profiling():
+                self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
@@ -1100,17 +1120,13 @@ class EAGLEWorker(TpModelWorker):
         logger.info("Initializing tile-spec profiling...")
         self.tile_spec_profiler = TileSpecProfiler(self.server_args)
 
-        # Run profiling (latency + calibration)
-        self.latency_model, self.calibration = self.tile_spec_profiler.run_profiling(
-            target_worker=self.target_worker,
-            draft_worker=self,
-            tokenizer=None,  # TODO: pass tokenizer for ShareGPT calibration
-        )
+        # Get models (from cache or None if need online profiling)
+        self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
 
         if self.latency_model:
-            logger.info(f"Tile-spec enabled with boundaries: {self.latency_model.get_boundaries()}")
+            logger.info(f"Tile-spec loaded from cache with boundaries: {self.latency_model.get_boundaries()}")
         else:
-            logger.warning("Tile-spec latency model not loaded, optimization disabled")
+            logger.info("Tile-spec will profile online during inference (send requests to collect data)")
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
