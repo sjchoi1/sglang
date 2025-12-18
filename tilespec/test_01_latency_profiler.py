@@ -1,15 +1,15 @@
 """
-Test 1: Latency Profiler
-========================
-Measures MLP forward pass latency at different token counts to detect tile boundaries.
+Test 1: Latency Profiler with Visualization
+============================================
+Measures MLP forward pass latency at different token counts to detect tile boundaries,
+then generates a visualization.
 
 Usage:
     python tilespec/test_01_latency_profiler.py
 
-Expected output:
-    - Latency measurements for various token counts
-    - Detected tile boundaries (where latency jumps >15%)
-    - Saved latency data to tilespec/latency_raw.npz
+Output:
+    - tilespec/latency_raw.npz (raw data)
+    - tilespec/latency_plot.png (visualization)
 """
 
 import os
@@ -22,6 +22,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
 
 def measure_mlp_latency(
     total_tokens: int,
@@ -32,7 +38,6 @@ def measure_mlp_latency(
 ) -> float:
     """
     Measure MLP forward pass latency for given token count.
-
     Uses Llama-style MLP dimensions by default (8B model).
     """
     device = "cuda"
@@ -68,6 +73,61 @@ def measure_mlp_latency(
     return np.median(times) * 1000  # ms
 
 
+def visualize(tokens, latencies, boundaries, output_dir):
+    """Generate visualization of latency data."""
+    if not HAS_MATPLOTLIB:
+        print("Installing matplotlib...")
+        import subprocess
+        subprocess.check_call(["pip", "install", "matplotlib"])
+        import matplotlib.pyplot as plt
+
+    # Create figure
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+
+    # Plot 1: Raw latency
+    ax1.plot(tokens, latencies, 'b-', linewidth=1, alpha=0.7, label='Measured Latency')
+
+    # Mark tile boundaries
+    for b in boundaries[1:-1]:
+        ax1.axvline(x=b, color='r', linestyle='--', alpha=0.7, linewidth=1.5)
+        ax1.annotate(f'{b}', xy=(b, max(latencies) * 0.95), ha='center', fontsize=9, color='red')
+
+    ax1.set_xlabel('Token Count', fontsize=12)
+    ax1.set_ylabel('Latency (ms)', fontsize=12)
+    ax1.set_title('MLP Latency vs Token Count (Tile Boundaries in Red)', fontsize=14)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    # Plot 2: Latency jump percentage
+    jumps = []
+    jump_tokens = []
+    for i in range(1, len(tokens)):
+        if latencies[i-1] > 0:
+            jump = (latencies[i] - latencies[i-1]) / latencies[i-1] * 100
+            jumps.append(jump)
+            jump_tokens.append(tokens[i])
+
+    colors = ['red' if j > 15 else 'steelblue' for j in jumps]
+    ax2.bar(jump_tokens, jumps, width=1, color=colors, alpha=0.7)
+    ax2.axhline(y=15, color='r', linestyle='--', linewidth=1.5, label='15% threshold')
+    ax2.axhline(y=0, color='black', linewidth=0.5)
+
+    ax2.set_xlabel('Token Count', fontsize=12)
+    ax2.set_ylabel('Latency Jump (%)', fontsize=12)
+    ax2.set_title('Latency Jump Between Consecutive Token Counts (Red = >15%)', fontsize=14)
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+    ax2.set_ylim(-10, max(jumps) * 1.1 if jumps else 50)
+
+    plt.tight_layout()
+
+    # Save
+    output_path = os.path.join(output_dir, "latency_plot.png")
+    plt.savefig(output_path, dpi=150)
+    print(f"Saved plot to: {output_path}")
+    plt.close()
+
+
 def main():
     print("=" * 60)
     print("TileSpec Test 1: Latency Profiler")
@@ -93,10 +153,14 @@ def main():
 
     # Profile
     results = []
-    for n in token_counts:
+    for i, n in enumerate(token_counts):
         lat = measure_mlp_latency(n)
         results.append((n, lat))
-        print(f"n={n:4d}: {lat:.4f} ms")
+        if n % 50 == 0 or n <= 10:
+            print(f"n={n:4d}: {lat:.4f} ms")
+
+    tokens = np.array([r[0] for r in results])
+    latencies = np.array([r[1] for r in results])
 
     # Detect boundaries
     print()
@@ -104,7 +168,7 @@ def main():
     print("Detected Tile Boundaries (>15% latency jump):")
     print("-" * 60)
 
-    boundaries = [results[0][0]]  # Start with first token count
+    boundaries = [results[0][0]]
     for i in range(1, len(results)):
         prev_n, prev_lat = results[i-1]
         curr_n, curr_lat = results[i]
@@ -114,7 +178,7 @@ def main():
                 boundaries.append(curr_n)
                 print(f"  {prev_n:4d} -> {curr_n:4d}: +{jump*100:.1f}% ({prev_lat:.4f} -> {curr_lat:.4f} ms)")
 
-    boundaries.append(max_tokens + step)  # End boundary
+    boundaries.append(max_tokens + step)
 
     print()
     print(f"Boundaries: {boundaries}")
@@ -122,12 +186,13 @@ def main():
     # Save raw data
     output_dir = os.path.dirname(os.path.abspath(__file__))
     output_path = os.path.join(output_dir, "latency_raw.npz")
-
-    tokens_arr = np.array([r[0] for r in results])
-    latencies_arr = np.array([r[1] for r in results])
-
-    np.savez(output_path, tokens=tokens_arr, latencies=latencies_arr, boundaries=boundaries)
+    np.savez(output_path, tokens=tokens, latencies=latencies, boundaries=boundaries)
     print(f"Saved raw data to: {output_path}")
+
+    # Generate visualization
+    print()
+    print("Generating visualization...")
+    visualize(tokens, latencies, boundaries, output_dir)
 
     print()
     print("=" * 60)
