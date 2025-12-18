@@ -172,8 +172,22 @@ class PiecewiseLinearLatency:
         return 1.0  # fallback
 
     def get_boundaries(self) -> List[int]:
-        """Return tile boundaries for optimization."""
+        """Return tile boundaries (segment start points)."""
         return self.boundaries[:-1]
+
+    def get_optimal_k_candidates(self) -> List[int]:
+        """
+        Return optimal k values for searching.
+
+        These are the END of each segment minus 1, which gives
+        maximum tokens before the next latency jump.
+
+        Example: boundaries = [1, 65, 129, 193, 257, 385, 513]
+        Returns: [64, 128, 192, 256, 384, 512]
+        """
+        # Skip the first boundary (usually 1) and return boundary[i] - 1
+        candidates = [b - 1 for b in self.boundaries[1:]]
+        return candidates
 
     def save(self, path: str):
         np.savez(
@@ -240,8 +254,8 @@ def compute_optimal_k(
     # Cumulative expected accepted tokens
     cum_E = torch.cumsum(sorted_probs, dim=0)
 
-    # Search over tile boundaries
-    candidates = latency_model.get_boundaries()
+    # Search over optimal k candidates (end of each tile segment)
+    candidates = latency_model.get_optimal_k_candidates()
     max_tokens = min(max_k, len(sorted_probs))
 
     best_k = min(candidates[0], max_tokens) if candidates else 32

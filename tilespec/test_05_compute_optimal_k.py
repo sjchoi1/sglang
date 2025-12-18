@@ -88,13 +88,13 @@ def test_batch_size_impact(calibration, latency_model, max_k=256):
 
 
 def test_boundary_selection(calibration, latency_model):
-    """Verify that selected k values are at tile boundaries."""
+    """Verify that selected k values are at optimal points (end of tile segments)."""
 
-    print("Verifying k selection is at tile boundaries:")
+    print("Verifying k selection is at optimal points:")
     print("-" * 70)
 
-    boundaries = latency_model.get_boundaries()
-    print(f"Available boundaries: {boundaries}")
+    candidates = latency_model.get_optimal_k_candidates()
+    print(f"Optimal k candidates: {candidates}")
     print()
 
     # Test multiple random scenarios
@@ -114,14 +114,14 @@ def test_boundary_selection(calibration, latency_model):
             max_k=max_k,
         )
 
-        # Check if optimal_k is at a boundary (or minimum value 8)
-        valid_k = optimal_k in boundaries or optimal_k == 8
+        # Check if optimal_k is at a candidate point (or minimum value 8)
+        valid_k = optimal_k in candidates or optimal_k == 8
         if not valid_k:
             all_at_boundary = False
-            print(f"  ✗ Test {i+1}: k={optimal_k} NOT at boundary (bs={bs}, max_k={max_k})")
+            print(f"  ✗ Test {i+1}: k={optimal_k} NOT at optimal point (bs={bs}, max_k={max_k})")
         else:
             if i < 5:  # Only print first 5
-                print(f"  ✓ Test {i+1}: k={optimal_k} at boundary (bs={bs}, max_k={max_k})")
+                print(f"  ✓ Test {i+1}: k={optimal_k} at optimal point (bs={bs}, max_k={max_k})")
 
     if all_at_boundary:
         print(f"  ... ({num_tests - 5} more tests passed)")
@@ -137,10 +137,10 @@ def test_boundary_selection(calibration, latency_model):
 def analyze_el_ratio(calibration, latency_model, max_k=256):
     """Analyze E/L ratio at different k values."""
 
-    print("E/L Ratio Analysis at Each Boundary:")
+    print("E/L Ratio Analysis at Optimal k Candidates:")
     print("-" * 70)
 
-    boundaries = [b for b in latency_model.get_boundaries() if b <= max_k]
+    candidates = [k for k in latency_model.get_optimal_k_candidates() if k <= max_k]
     bs = 4
 
     # Generate medium-quality scores (50% acceptance expected)
@@ -158,7 +158,7 @@ def analyze_el_ratio(calibration, latency_model, max_k=256):
     best_k = 8
     best_ratio = 0.0
 
-    for k in boundaries:
+    for k in candidates:
         if k <= 0 or k > len(sorted_probs):
             continue
 
