@@ -786,16 +786,11 @@ class EAGLEWorker(TpModelWorker):
             torch.cuda.synchronize()
             latency_ms = (time.perf_counter() - _profile_start) * 1000
             num_tokens = spec_info.draft_token_num * len(batch.seq_lens)
-            self.tile_spec_profiler.record_verification(
-                num_tokens=num_tokens,
-                latency_ms=latency_ms,
-                # TODO: add calibration scores and accepted once extracted from res
-            )
-            # Check if profiling is complete
-            if not self.tile_spec_profiler.is_profiling():
-                self.tile_spec_profiler.finish_profiling()
+            was_profiling = self.tile_spec_profiler.is_profiling()
+            self.tile_spec_profiler.record(num_tokens, latency_ms)
+            # Update models when profiling finishes (record() auto-finishes)
+            if was_profiling and not self.tile_spec_profiler.is_profiling():
                 self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
-                logger.info(f"Tile-spec profiling complete. Boundaries: {self.latency_model.get_boundaries()}")
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
@@ -1115,24 +1110,18 @@ class EAGLEWorker(TpModelWorker):
         return success, message
 
     def init_tile_spec(self):
-        """Initialize tile-spec profiling. Called after full worker initialization."""
+        """Initialize tile-spec. Called after full worker initialization."""
         if not self.enable_tile_spec:
             return
 
-        logger.info("Initializing tile-spec...")
         self.tile_spec_profiler = TileSpecProfiler(self.server_args)
-
-        # Get models from cache
         self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
 
         if self.latency_model:
-            logger.info(f"Tile-spec loaded from cache with boundaries: {self.latency_model.get_boundaries()}")
+            logger.info(f"Tile-spec loaded from cache: {self.latency_model.boundaries}")
         else:
-            # No cache - start online profiling mode
-            # Profiling will happen during actual verify() calls
-            logger.info("No tile-spec cache found - starting online profiling...")
-            logger.info("Run warmup with: python -m sglang.srt.speculative.tile_spec.warmup")
-            self.tile_spec_profiler.start_profiling(min_samples=100)
+            logger.info("No tile-spec cache - starting profiling (send ~100 requests)")
+            self.tile_spec_profiler.start_profiling()
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
