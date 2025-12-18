@@ -79,6 +79,7 @@ if is_cuda():
 
 logger = logging.getLogger(__name__)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+SGLANG_TILE_SPEC_CALIBRATE = get_bool_env_var("SGLANG_TILE_SPEC_CALIBRATE")
 
 
 class EAGLEWorker(TpModelWorker):
@@ -119,6 +120,10 @@ class EAGLEWorker(TpModelWorker):
         else:
             self.calibration = None
             self.latency_model = None
+
+        # Tile-spec calibration data collection
+        self._calibrate_scores = None  # Temp storage for scores between draft and verify
+        self._calibrate_data = [] if SGLANG_TILE_SPEC_CALIBRATE else None
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -694,6 +699,11 @@ class EAGLEWorker(TpModelWorker):
             score_list, token_list, parents_list, num_draft_tokens
         )
 
+        # Save scores for calibration (if enabled)
+        if self._calibrate_data is not None:
+            scores_cat = torch.cat(score_list, dim=1).flatten(1)
+            self._calibrate_scores = scores_cat.gather(1, top_scores_index).cpu()
+
         return parent_list, top_scores_index, draft_tokens, num_draft_tokens
 
     def clear_cache_pool(self):
@@ -788,6 +798,10 @@ class EAGLEWorker(TpModelWorker):
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
         batch.spec_info = res.draft_input
+
+        # Collect calibration data (if enabled)
+        if self._calibrate_data is not None and self._calibrate_scores is not None:
+            self._collect_calibration_data(res.accept_length_per_req_cpu)
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
@@ -1099,6 +1113,27 @@ class EAGLEWorker(TpModelWorker):
             load_format=recv_req.load_format,
         )
         return success, message
+
+    def _collect_calibration_data(self, accept_length_per_req: List[int]):
+        """Collect (score, accepted) pairs for tile-spec calibration."""
+        scores = self._calibrate_scores  # (bs, num_draft_tokens-1)
+        bs, num_draft = scores.shape
+
+        for i, accept_len in enumerate(accept_length_per_req):
+            for j in range(num_draft):
+                score = scores[i, j].item()
+                accepted = 1.0 if j < accept_len else 0.0
+                self._calibrate_data.append((score, accepted))
+
+        self._calibrate_scores = None  # Clear
+
+    def save_calibration_data(self, path: str):
+        """Save collected calibration data to file."""
+        if self._calibrate_data:
+            import numpy as np
+            data = np.array(self._calibrate_data, dtype=np.float32)
+            np.savez(path, scores=data[:, 0], accepted=data[:, 1])
+            logger.info(f"Saved {len(self._calibrate_data)} calibration samples to {path}")
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
