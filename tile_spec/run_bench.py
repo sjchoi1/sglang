@@ -16,6 +16,7 @@ Methodology:
 
 Usage:
     python tile_spec/run_bench.py --configs AR Eagle3 Eagle3+TileSpec
+    python tile_spec/run_bench.py --batch-sizes 1 4 16 64
 """
 
 import argparse
@@ -228,11 +229,11 @@ def run_dataset(engine, samples: List[dict], name: str) -> Result:
     )
 
 
-def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir: Path) -> Dict[str, Result]:
+def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir: Path, batch_size: int = 1) -> Dict[str, Result]:
     """Run all datasets for a config."""
     import sglang as sgl
 
-    kwargs = {"model_path": model, "dtype": "float16"}
+    kwargs = {"model_path": model, "dtype": "float16", "max_running_requests": batch_size}
     if config.speculative_algorithm:
         kwargs.update({
             "speculative_algorithm": config.speculative_algorithm,
@@ -244,7 +245,7 @@ def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir
     if config.tile_spec:
         kwargs["tile_spec"] = True
 
-    print(f"\n{'='*70}\nConfig: {config.name}\n{'='*70}")
+    print(f"\n{'='*70}\nConfig: {config.name} (batch_size={batch_size})\n{'='*70}")
     engine = sgl.Engine(**kwargs)
 
     # Warmup with ShareGPT (also does profiling for tile-spec)
@@ -289,6 +290,7 @@ def main():
     parser.add_argument("--output", default="tile_spec/results.json")
     parser.add_argument("--configs", nargs="+", default=["AR", "Eagle3", "Eagle3+TileSpec"])
     parser.add_argument("--datasets", nargs="+", default=["mt_bench", "humaneval", "gsm8k", "alpaca", "cnn_dm"])
+    parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1])
     args = parser.parse_args()
 
     cache_dir = Path(args.cache_dir)
@@ -309,51 +311,59 @@ def main():
         "Eagle3+TileSpec": Config("Eagle3+TileSpec", "EAGLE3", args.draft, tile_spec=True),
     }
 
-    # Run
-    all_results = {}
-    ar_results = None
-    for name in args.configs:
-        results = run_config(all_configs[name], datasets, args.model, args.draft, cache_dir)
-        all_results[name] = results
-        if name == "AR":
-            ar_results = results
-        elif ar_results:
-            for ds, r in results.items():
-                if ds in ar_results:
-                    r.speedup = r.throughput / ar_results[ds].throughput if ar_results[ds].throughput > 0 else 1.0
-
-    # Print summary
-    print(f"\n{'='*90}")
-    print(f"{'Dataset':<12} | ", end="")
-    for name in args.configs:
-        print(f"{name:<24} | ", end="")
-    print()
-    print("-" * 90)
-    for ds in args.datasets:
-        print(f"{ds:<12} | ", end="")
+    # Run all batch sizes
+    all_results = {}  # {batch_size: {config_name: {dataset_name: Result}}}
+    for batch_size in args.batch_sizes:
+        print(f"\n{'#'*90}\n# Batch Size: {batch_size}\n{'#'*90}")
+        all_results[batch_size] = {}
+        ar_results = None
         for name in args.configs:
-            r = all_results[name].get(ds)
-            if r:
-                print(f"{r.speedup:>5.2f}x  τ={r.accept_length:<6.2f} | ", end="")
-            else:
-                print(f"{'N/A':<24} | ", end="")
+            results = run_config(all_configs[name], datasets, args.model, args.draft, cache_dir, batch_size)
+            all_results[batch_size][name] = results
+            if name == "AR":
+                ar_results = results
+            elif ar_results:
+                for ds, r in results.items():
+                    if ds in ar_results:
+                        r.speedup = r.throughput / ar_results[ds].throughput if ar_results[ds].throughput > 0 else 1.0
+
+        # Print summary for this batch size
+        print(f"\n{'='*90}")
+        print(f"Batch Size: {batch_size}")
+        print(f"{'Dataset':<12} | ", end="")
+        for name in args.configs:
+            print(f"{name:<24} | ", end="")
         print()
-    print("-" * 90)
-    print(f"{'Mean':<12} | ", end="")
-    for name in args.configs:
-        speedups = [all_results[name][ds].speedup for ds in args.datasets if ds in all_results[name]]
-        accepts = [all_results[name][ds].accept_length for ds in args.datasets if ds in all_results[name]]
-        if speedups:
-            print(f"{sum(speedups)/len(speedups):>5.2f}x  τ={sum(accepts)/len(accepts):<6.2f} | ", end="")
-    print()
+        print("-" * 90)
+        for ds in args.datasets:
+            print(f"{ds:<12} | ", end="")
+            for name in args.configs:
+                r = all_results[batch_size][name].get(ds)
+                if r:
+                    print(f"{r.speedup:>5.2f}x  τ={r.accept_length:<6.2f} | ", end="")
+                else:
+                    print(f"{'N/A':<24} | ", end="")
+            print()
+        print("-" * 90)
+        print(f"{'Mean':<12} | ", end="")
+        for name in args.configs:
+            speedups = [all_results[batch_size][name][ds].speedup for ds in args.datasets if ds in all_results[batch_size][name]]
+            accepts = [all_results[batch_size][name][ds].accept_length for ds in args.datasets if ds in all_results[batch_size][name]]
+            if speedups:
+                print(f"{sum(speedups)/len(speedups):>5.2f}x  τ={sum(accepts)/len(accepts):<6.2f} | ", end="")
+        print()
 
     # Save
     Path(args.output).parent.mkdir(exist_ok=True)
     with open(args.output, "w") as f:
         json.dump({
             "model": args.model, "draft": args.draft,
-            "results": {n: {d: {"speedup": r.speedup, "accept_length": r.accept_length, "throughput": r.throughput}
-                            for d, r in res.items()} for n, res in all_results.items()}
+            "batch_sizes": args.batch_sizes,
+            "results": {
+                bs: {n: {d: {"speedup": r.speedup, "accept_length": r.accept_length, "throughput": r.throughput}
+                         for d, r in res.items()} for n, res in cfg_results.items()}
+                for bs, cfg_results in all_results.items()
+            }
         }, f, indent=2)
     print(f"\nSaved to {args.output}")
 
