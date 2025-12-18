@@ -62,8 +62,10 @@ def visualize_calibration(scores, accepted, calibration, output_dir):
             empirical_probs.append(np.nan)
             bin_counts.append(0)
 
-        # Get fitted probability for bin center
-        fitted_probs.append(calibration.bin_probs[min(i, len(calibration.bin_probs) - 1)])
+        # Get fitted probability for bin center (lookup by value, not index)
+        bin_center = (lo + hi) / 2
+        cal_bin_idx = min(int(bin_center * calibration.num_bins), calibration.num_bins - 1)
+        fitted_probs.append(calibration.bin_probs[cal_bin_idx])
 
     # Bar chart comparison
     x = np.arange(num_bins)
