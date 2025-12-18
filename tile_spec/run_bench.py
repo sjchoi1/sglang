@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-EAGLE-3 Paper Benchmark.
+TileSpec Benchmark.
 
-Exact 5 datasets from EAGLE-3 paper:
+5 datasets for comprehensive evaluation:
 1. MT-bench (80) - multi-turn conversation
 2. HumanEval (164) - code generation
 3. GSM8K (500) - math reasoning
@@ -15,7 +15,7 @@ Methodology:
 - ShareGPT for profiling warmup
 
 Usage:
-    python tile_spec/eagle_bench.py --configs AR Eagle3 Eagle3+TileSpec
+    python tile_spec/run_bench.py --configs AR Eagle3 Eagle3+TileSpec
 """
 
 import argparse
