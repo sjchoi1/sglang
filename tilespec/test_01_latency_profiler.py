@@ -75,11 +75,14 @@ def measure_mlp_latency(
 
 def visualize(tokens, latencies, boundaries, output_dir):
     """Generate visualization of latency data."""
+    global HAS_MATPLOTLIB
     if not HAS_MATPLOTLIB:
         print("Installing matplotlib...")
         import subprocess
         subprocess.check_call(["pip", "install", "matplotlib"])
-        import matplotlib.pyplot as plt
+        HAS_MATPLOTLIB = True
+
+    import matplotlib.pyplot as plt
 
     # Create figure
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
