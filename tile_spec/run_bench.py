@@ -281,9 +281,10 @@ def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir
     """Run all datasets for a config."""
     import sglang as sgl
 
-    # For TileSpec profiling, need high max_running_requests to vary batch sizes
+    # For TileSpec profiling, need varied max_running_requests for batch size variation
+    # Use 64 max to avoid CUDA graph memory issues on smaller GPUs
     # After profiling (cached), we use the target batch_size for benchmarking
-    profiling_max_reqs = 128 if config.tile_spec else batch_size
+    profiling_max_reqs = 64 if config.tile_spec else batch_size
 
     kwargs = {"model_path": model, "dtype": "float16", "max_running_requests": profiling_max_reqs}
     if config.speculative_algorithm:
@@ -315,10 +316,10 @@ def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir
             prompts = list(sharegpt_iter)
 
             # Send concurrent requests to vary batch sizes (needed for latency curve)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
                 while not engine.tile_spec_ready() and count < len(prompts):
                     # Submit batch of requests concurrently
-                    batch_end = min(count + 32, len(prompts))
+                    batch_end = min(count + 16, len(prompts))
                     futures = [
                         executor.submit(engine.generate, prompts[i], {"temperature": 0})
                         for i in range(count, batch_end)
