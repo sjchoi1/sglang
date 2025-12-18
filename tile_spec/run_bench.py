@@ -17,6 +17,7 @@ Methodology:
 Usage:
     python tile_spec/run_bench.py --configs AR Eagle3 Eagle3+TileSpec
     python tile_spec/run_bench.py --batch-sizes 1 4 16 64
+    python tile_spec/run_bench.py --batch-sizes 1 64 128 --min-samples 512
 """
 
 import argparse
@@ -168,6 +169,16 @@ DATASETS = {
 }
 
 
+def cycle_samples(samples: List[dict], min_samples: int) -> List[dict]:
+    """Cycle samples to reach min_samples for larger batch sizes."""
+    if len(samples) >= min_samples:
+        return samples
+    repeated = []
+    while len(repeated) < min_samples:
+        repeated.extend(samples)
+    return repeated[:min_samples]
+
+
 def format_chat(messages: List[dict]) -> str:
     """Format conversation as Llama-style chat string."""
     parts = []
@@ -229,7 +240,7 @@ def run_dataset(engine, samples: List[dict], name: str) -> Result:
     )
 
 
-def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir: Path, batch_size: int = 1) -> Dict[str, Result]:
+def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir: Path, batch_size: int = 1, min_samples: int = 0) -> Dict[str, Result]:
     """Run all datasets for a config."""
     import sglang as sgl
 
@@ -270,7 +281,12 @@ def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir
     # Run datasets
     results = {}
     for name, samples in datasets.items():
-        print(f"\n  [{name}] {len(samples)} samples...")
+        # Cycle samples if needed for larger batch sizes
+        if min_samples > 0 and len(samples) < min_samples:
+            samples = cycle_samples(samples, min_samples)
+            print(f"\n  [{name}] {len(samples)} samples (cycled from {len(datasets[name])})")
+        else:
+            print(f"\n  [{name}] {len(samples)} samples...")
         result = run_dataset(engine, samples, name)
         results[name] = result
         print(f"    {result.throughput:.1f} tok/s, τ={result.accept_length:.2f}")
@@ -291,6 +307,7 @@ def main():
     parser.add_argument("--configs", nargs="+", default=["AR", "Eagle3", "Eagle3+TileSpec"])
     parser.add_argument("--datasets", nargs="+", default=["mt_bench", "humaneval", "gsm8k", "alpaca", "cnn_dm"])
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1])
+    parser.add_argument("--min-samples", type=int, default=0, help="Min samples per dataset (0=auto: batch_size*8)")
     args = parser.parse_args()
 
     cache_dir = Path(args.cache_dir)
@@ -314,11 +331,13 @@ def main():
     # Run all batch sizes
     all_results = {}  # {batch_size: {config_name: {dataset_name: Result}}}
     for batch_size in args.batch_sizes:
-        print(f"\n{'#'*90}\n# Batch Size: {batch_size}\n{'#'*90}")
+        # Auto-compute min_samples: batch_size * 8 for stable measurements
+        min_samples = args.min_samples if args.min_samples > 0 else batch_size * 8
+        print(f"\n{'#'*90}\n# Batch Size: {batch_size} (min_samples={min_samples})\n{'#'*90}")
         all_results[batch_size] = {}
         ar_results = None
         for name in args.configs:
-            results = run_config(all_configs[name], datasets, args.model, args.draft, cache_dir, batch_size)
+            results = run_config(all_configs[name], datasets, args.model, args.draft, cache_dir, batch_size, min_samples)
             all_results[batch_size][name] = results
             if name == "AR":
                 ar_results = results
