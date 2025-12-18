@@ -82,9 +82,9 @@ def main():
     print()
 
     # Configuration
-    min_tokens = 8
+    min_tokens = 1
     max_tokens = 512
-    step = 8
+    step = 1  # Fine granularity to detect exact boundaries
 
     token_counts = list(range(min_tokens, max_tokens + 1, step))
 
