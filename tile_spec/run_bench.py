@@ -81,7 +81,8 @@ class Result:
     total_tokens: int
     total_time: float
     throughput: float
-    accept_length: float
+    accept_length: float  # τ: mean tokens accepted per step
+    accept_rate: float    # n-α: proportion of drafts accepted
     speedup: float = 1.0
 
 
@@ -226,7 +227,8 @@ def run_dataset(engine, samples: List[dict], name: str) -> Result:
     """Run benchmark on dataset. No max_new_tokens - natural EOS."""
     total_tokens = 0
     total_time = 0.0
-    accept_lengths = []
+    accept_lengths = []  # τ: tokens per step
+    accept_rates = []    # n-α: proportion accepted
 
     for sample in samples:
         if "turns" in sample:
@@ -246,6 +248,8 @@ def run_dataset(engine, samples: List[dict], name: str) -> Result:
                 total_tokens += meta.get("completion_tokens", len(result.get("text", "").split()))
                 if meta.get("spec_accept_length", 0) > 0:
                     accept_lengths.append(meta["spec_accept_length"])
+                if meta.get("spec_accept_rate", 0) > 0:
+                    accept_rates.append(meta["spec_accept_rate"])
                 messages.append({"role": "assistant", "content": result.get("text", "")})
         else:
             # Single turn
@@ -259,6 +263,8 @@ def run_dataset(engine, samples: List[dict], name: str) -> Result:
             total_tokens += meta.get("completion_tokens", len(result.get("text", "").split()))
             if meta.get("spec_accept_length", 0) > 0:
                 accept_lengths.append(meta["spec_accept_length"])
+            if meta.get("spec_accept_rate", 0) > 0:
+                accept_rates.append(meta["spec_accept_rate"])
 
     return Result(
         dataset=name,
@@ -267,6 +273,7 @@ def run_dataset(engine, samples: List[dict], name: str) -> Result:
         total_time=total_time,
         throughput=total_tokens / total_time if total_time > 0 else 0,
         accept_length=sum(accept_lengths) / len(accept_lengths) if accept_lengths else 1.0,
+        accept_rate=sum(accept_rates) / len(accept_rates) if accept_rates else 0.0,
     )
 
 
@@ -316,7 +323,7 @@ def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir
         print(f"\n  [{name}] {len(samples)} samples")
         result = run_dataset(engine, samples, name)
         results[name] = result
-        print(f"    {result.throughput:.1f} tok/s, τ={result.accept_length:.2f}")
+        print(f"    {result.throughput:.1f} tok/s, τ={result.accept_length:.2f}, α={result.accept_rate:.2f}")
 
     engine.shutdown()
     del engine
@@ -414,28 +421,33 @@ def main():
                 if runs:
                     speedups = [r.speedup for r in runs]
                     accepts = [r.accept_length for r in runs]
+                    rates = [r.accept_rate for r in runs]
                     sp_mean = statistics.mean(speedups)
                     sp_std = statistics.stdev(speedups) if len(speedups) > 1 else 0
                     ac_mean = statistics.mean(accepts)
-                    print(f"{sp_mean:>5.2f}x±{sp_std:<4.2f} τ={ac_mean:<5.2f} | ", end="")
+                    ar_mean = statistics.mean(rates) if rates else 0
+                    print(f"{sp_mean:>5.2f}x±{sp_std:<4.2f} τ={ac_mean:<4.2f} α={ar_mean:<4.2f}| ", end="")
                 else:
-                    print(f"{'N/A':<28} | ", end="")
+                    print(f"{'N/A':<32} | ", end="")
             print()
 
-        print("-" * 100)
+        print("-" * 110)
         print(f"{'Overall':<12} | ", end="")
         for cfg_name in args.configs:
             all_speedups = []
             all_accepts = []
+            all_rates = []
             for ds in args.datasets:
                 runs = all_runs[batch_size][cfg_name].get(ds, [])
                 all_speedups.extend([r.speedup for r in runs])
                 all_accepts.extend([r.accept_length for r in runs])
+                all_rates.extend([r.accept_rate for r in runs])
             if all_speedups:
                 sp_mean = statistics.mean(all_speedups)
                 sp_std = statistics.stdev(all_speedups) if len(all_speedups) > 1 else 0
                 ac_mean = statistics.mean(all_accepts)
-                print(f"{sp_mean:>5.2f}x±{sp_std:<4.2f} τ={ac_mean:<5.2f} | ", end="")
+                ar_mean = statistics.mean(all_rates) if all_rates else 0
+                print(f"{sp_mean:>5.2f}x±{sp_std:<4.2f} τ={ac_mean:<4.2f} α={ar_mean:<4.2f}| ", end="")
         print()
 
     # Compute summary statistics
@@ -449,11 +461,13 @@ def main():
                 if runs:
                     speedups = [r.speedup for r in runs]
                     accepts = [r.accept_length for r in runs]
+                    rates = [r.accept_rate for r in runs]
                     throughputs = [r.throughput for r in runs]
                     summary[bs][cfg][ds] = {
                         "speedup_mean": round(statistics.mean(speedups), 3),
                         "speedup_std": round(statistics.stdev(speedups), 3) if len(speedups) > 1 else 0,
-                        "accept_length_mean": round(statistics.mean(accepts), 3),
+                        "accept_length_mean": round(statistics.mean(accepts), 3),  # τ
+                        "accept_rate_mean": round(statistics.mean(rates), 3) if rates else 0,  # α
                         "throughput_mean": round(statistics.mean(throughputs), 1),
                         "throughput_std": round(statistics.stdev(throughputs), 1) if len(throughputs) > 1 else 0,
                         "num_runs": len(runs),
