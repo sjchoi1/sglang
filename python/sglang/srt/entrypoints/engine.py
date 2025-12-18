@@ -271,14 +271,40 @@ class Engine(EngineBase):
         if self.tile_spec_ready():
             return  # Already profiled (loaded from cache)
 
-        from sglang.srt.speculative.tile_spec.profiler import TileSpecProfiler
+        from sglang.srt.speculative.tile_spec.profiler import _load_prompts, get_cache_dir
+        import torch
+        import logging
 
-        # Create profiler to run warmup (scheduler has its own instance)
-        profiler = TileSpecProfiler(self.server_args)
-        if not profiler.needs_profiling():
-            return
+        logger = logging.getLogger(__name__)
+        logger.info("TileSpec: Running warmup profiling...")
 
-        profiler.run_warmup(self.generate)
+        # Load prompts for warmup
+        cache_dir = get_cache_dir(
+            self.server_args.model_path,
+            torch.cuda.get_device_name(0),
+            self.server_args.tp_size,
+        )
+        prompts = _load_prompts(cache_dir, limit=100)
+
+        # Run warmup with varying batch sizes - data recorded by scheduler's profiler
+        batch_sizes = [1, 4, 16, 64]
+        idx = 0
+        for bs in batch_sizes:
+            for _ in range(8):
+                batch = [prompts[(idx + j) % len(prompts)] for j in range(bs)]
+                idx += bs
+                try:
+                    self.generate(batch, sampling_params={"temperature": 0, "max_new_tokens": 32})
+                except Exception as e:
+                    logger.warning(f"TileSpec warmup batch failed: {e}")
+
+        # Wait for scheduler's profiler to finish (auto-finishes when enough samples)
+        for _ in range(10):
+            if self.tile_spec_ready():
+                logger.info("TileSpec: Profiling complete")
+                break
+            import time
+            time.sleep(0.5)
 
     def generate(
         self,
@@ -554,12 +580,16 @@ class Engine(EngineBase):
         - profiling has finished (enough samples collected)
         - models are loaded from cache
         """
+        if not getattr(self.server_args, 'tile_spec', False):
+            return True  # Not enabled = always ready
+
         internal_states = self.loop.run_until_complete(
             self.tokenizer_manager.get_internal_state()
         )
         # Check all DP ranks (usually just one)
         for state in internal_states:
-            if not state.get("tile_spec_ready", True):
+            # Default to False (not ready) if key doesn't exist
+            if not state.get("tile_spec_ready", False):
                 return False
         return True
 

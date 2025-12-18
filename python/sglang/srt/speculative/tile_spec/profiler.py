@@ -184,26 +184,3 @@ class TileSpecProfiler:
         logger.info(f"TileSpec: Complete, boundaries={self.latency_model.boundaries}")
         self._latency_data.clear()
         self._calibration_data.clear()
-
-    def run_warmup(self, generate_func):
-        """Run warmup profiling with varying batch sizes."""
-        if not self.needs_profiling():
-            return
-
-        logger.info("TileSpec: Running warmup profiling...")
-        prompts = _load_prompts(self.cache_dir, limit=100)
-        self.start_profiling()
-
-        # Fewer batches: [1, 4, 16, 64] x 8 each = 32 batches total
-        batch_sizes = [1, 4, 16, 64]
-        idx = 0
-        for bs in batch_sizes:
-            for _ in range(8):
-                batch = [prompts[(idx + j) % len(prompts)] for j in range(bs)]
-                idx += bs
-                try:
-                    generate_func(batch, sampling_params={"temperature": 0, "max_new_tokens": 32})
-                except Exception as e:
-                    logger.warning(f"Warmup failed: {e}")
-
-        self.finish_profiling()
