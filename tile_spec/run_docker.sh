@@ -13,4 +13,4 @@ docker run --gpus all -it --rm \
   -w /workspace/sglang \
   --shm-size=16g \
   lmsysorg/sglang:latest \
-  bash -c "pip install -e 'python[dev]' && exec bash"
+  bash -c "pip install -e 'python[dev]' && huggingface-cli login && exec bash"

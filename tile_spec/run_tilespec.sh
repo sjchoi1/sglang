@@ -1,9 +1,6 @@
 #!/bin/bash
 # Run sglang with tile-spec enabled
 
-# Set your HuggingFace token (required for gated models like Llama)
-export HF_TOKEN="your_token_here"
-
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 
 sglang serve --model-path meta-llama/Llama-3.1-8B-Instruct \
