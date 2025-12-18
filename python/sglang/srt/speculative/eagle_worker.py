@@ -716,11 +716,7 @@ class EAGLEWorker(TpModelWorker):
                 spec_info.retrive_next_token.shape
             ).cpu()
 
-        # Tile-spec profiling: measure actual verification latency
-        _profile_start = None
-        if self.enable_tile_spec and self.tile_spec_profiler and self.tile_spec_profiler.is_profiling():
-            torch.cuda.synchronize()
-            _profile_start = time.perf_counter()
+        # Tile-spec: no longer need to profile latency here (done at init)
 
         # Forward
         batch_result = self.target_worker.forward_batch_generation(
@@ -781,16 +777,7 @@ class EAGLEWorker(TpModelWorker):
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
 
-        # Tile-spec profiling: record verification data
-        if _profile_start is not None:
-            torch.cuda.synchronize()
-            latency_ms = (time.perf_counter() - _profile_start) * 1000
-            num_tokens = spec_info.draft_token_num * len(batch.seq_lens)
-            was_profiling = self.tile_spec_profiler.is_profiling()
-            self.tile_spec_profiler.record(num_tokens, latency_ms)
-            # Update models when profiling finishes (record() auto-finishes)
-            if was_profiling and not self.tile_spec_profiler.is_profiling():
-                self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
+        # Tile-spec: latency profiling now happens at init, not here
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
@@ -1110,18 +1097,25 @@ class EAGLEWorker(TpModelWorker):
         return success, message
 
     def init_tile_spec(self):
-        """Initialize tile-spec. Called after full worker initialization."""
+        """Initialize tile-spec with automatic profiling at init."""
         if not self.enable_tile_spec:
             return
 
         self.tile_spec_profiler = TileSpecProfiler(self.server_args)
+
+        # Try to load from cache first
         self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
 
         if self.latency_model:
             logger.info(f"Tile-spec loaded from cache: {self.latency_model.boundaries}")
         else:
-            logger.info("No tile-spec cache - starting profiling (send ~100 requests)")
-            self.tile_spec_profiler.start_profiling()
+            # Run automatic profiling at init
+            logger.info("TileSpec: Running automatic profiling at init...")
+            self.tile_spec_profiler.profile_at_init(
+                target_worker=self.target_worker,
+                draft_worker=self,
+            )
+            self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
