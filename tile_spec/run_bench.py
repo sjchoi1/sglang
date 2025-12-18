@@ -194,14 +194,19 @@ DATASETS = {
 }
 
 
-def cycle_samples(samples: List[dict], min_samples: int) -> List[dict]:
-    """Cycle samples to reach min_samples for larger batch sizes."""
-    if len(samples) >= min_samples:
+def cycle_samples(samples: List[dict], target_count: int) -> List[dict]:
+    """Cycle or truncate samples to reach exactly target_count."""
+    if len(samples) == target_count:
         return samples
-    repeated = []
-    while len(repeated) < min_samples:
-        repeated.extend(samples)
-    return repeated[:min_samples]
+    elif len(samples) > target_count:
+        # Truncate
+        return samples[:target_count]
+    else:
+        # Cycle up
+        repeated = []
+        while len(repeated) < target_count:
+            repeated.extend(samples)
+        return repeated[:target_count]
 
 
 def format_chat(messages: List[dict]) -> str:
@@ -306,10 +311,12 @@ def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir
     # Run datasets
     results = {}
     for name, samples in datasets.items():
-        # Cycle samples if needed for larger batch sizes
-        if min_samples > 0 and len(samples) < min_samples:
+        # Adjust samples to target count (cycle up or truncate down)
+        orig_len = len(samples)
+        if min_samples > 0 and orig_len != min_samples:
             samples = cycle_samples(samples, min_samples)
-            print(f"\n  [{name}] {len(samples)} samples (cycled from {len(datasets[name])})")
+            action = "cycled" if orig_len < min_samples else "truncated"
+            print(f"\n  [{name}] {len(samples)} samples ({action} from {orig_len})")
         else:
             print(f"\n  [{name}] {len(samples)} samples...")
         result = run_dataset(engine, samples, name)
