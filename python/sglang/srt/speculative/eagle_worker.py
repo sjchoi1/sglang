@@ -77,9 +77,13 @@ _is_npu = is_npu()
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
 
+import atexit
+import os
+
 logger = logging.getLogger(__name__)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 SGLANG_TILE_SPEC_CALIBRATE = get_bool_env_var("SGLANG_TILE_SPEC_CALIBRATE")
+SGLANG_TILE_SPEC_CALIBRATE_PATH = os.environ.get("SGLANG_TILE_SPEC_CALIBRATE_PATH", "calibration_raw.npz")
 
 
 class EAGLEWorker(TpModelWorker):
@@ -124,6 +128,9 @@ class EAGLEWorker(TpModelWorker):
         # Tile-spec calibration data collection
         self._calibrate_scores = None  # Temp storage for scores between draft and verify
         self._calibrate_data = [] if SGLANG_TILE_SPEC_CALIBRATE else None
+        if SGLANG_TILE_SPEC_CALIBRATE:
+            atexit.register(self._save_calibration_on_exit)
+            logger.info(f"Tile-spec calibration enabled, will save to {SGLANG_TILE_SPEC_CALIBRATE_PATH}")
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -1127,6 +1134,10 @@ class EAGLEWorker(TpModelWorker):
 
         self._calibrate_scores = None  # Clear
 
+        # Auto-save every 10000 samples
+        if len(self._calibrate_data) % 10000 == 0:
+            self.save_calibration_data(SGLANG_TILE_SPEC_CALIBRATE_PATH)
+
     def save_calibration_data(self, path: str):
         """Save collected calibration data to file."""
         if self._calibrate_data:
@@ -1134,6 +1145,11 @@ class EAGLEWorker(TpModelWorker):
             data = np.array(self._calibrate_data, dtype=np.float32)
             np.savez(path, scores=data[:, 0], accepted=data[:, 1])
             logger.info(f"Saved {len(self._calibrate_data)} calibration samples to {path}")
+
+    def _save_calibration_on_exit(self):
+        """Save calibration data on process exit."""
+        if self._calibrate_data:
+            self.save_calibration_data(SGLANG_TILE_SPEC_CALIBRATE_PATH)
 
 
 @torch.compile(dynamic=True, disable=_is_npu)

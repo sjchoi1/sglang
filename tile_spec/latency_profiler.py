@@ -1,16 +1,17 @@
 """
 Latency Profiler for Tile-Spec
 ==============================
-Measures MLP forward pass latency at different token counts to detect tile boundaries.
+Profiles real model forward pass latency to detect tile boundaries.
 
 Usage:
-    python tile_spec/latency_profiler.py
+    python tile_spec/latency_profiler.py --model-path meta-llama/Llama-3.1-8B-Instruct
 
 Output:
     - tile_spec/latency_model.npz (fitted model)
     - tile_spec/latency_plot.png (visualization)
 """
 
+import argparse
 import os
 import sys
 import time
@@ -18,57 +19,114 @@ import time
 import numpy as np
 import torch
 
-# Add python path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 
 from sglang.srt.speculative.tile_spec import PiecewiseLinearLatency
 
 
-def measure_mlp_latency(
-    total_tokens: int,
+def profile_model_forward(
+    model,
+    token_counts: list,
+    hidden_size: int,
+    num_warmup: int = 3,
+    num_runs: int = 10,
+) -> list:
+    """Profile model forward pass at different token counts."""
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+
+    results = []
+    for n_tokens in token_counts:
+        # Create dummy hidden states (simulating verification input)
+        hidden_states = torch.randn(n_tokens, hidden_size, device=device, dtype=dtype)
+
+        # Warmup
+        for _ in range(num_warmup):
+            with torch.no_grad():
+                # Run through model layers (simplified - just measures compute)
+                for layer in model.model.layers:
+                    hidden_states = layer(hidden_states, position_ids=torch.zeros(n_tokens, dtype=torch.long, device=device))[0]
+        torch.cuda.synchronize()
+
+        # Measure
+        times = []
+        for _ in range(num_runs):
+            hidden_states = torch.randn(n_tokens, hidden_size, device=device, dtype=dtype)
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            with torch.no_grad():
+                for layer in model.model.layers:
+                    hidden_states = layer(hidden_states, position_ids=torch.zeros(n_tokens, dtype=torch.long, device=device))[0]
+            torch.cuda.synchronize()
+            times.append(time.perf_counter() - start)
+
+        latency_ms = np.median(times) * 1000
+        results.append((n_tokens, latency_ms))
+
+        if n_tokens % 64 == 0 or n_tokens <= 16:
+            print(f"  n={n_tokens:4d}: {latency_ms:.3f} ms")
+
+    return results
+
+
+def profile_mlp_latency(
     hidden_size: int = 4096,
     intermediate_size: int = 14336,
+    num_layers: int = 32,
+    token_counts: list = None,
     num_warmup: int = 5,
     num_runs: int = 20,
-) -> float:
+) -> list:
     """
-    Measure MLP forward pass latency for given token count.
-    Uses Llama-style MLP dimensions by default (8B model).
+    Profile MLP forward pass latency (fallback when model not available).
+    Simulates full model by multiplying single layer latency.
     """
     device = "cuda"
 
-    # Create tensors
-    x = torch.randn(total_tokens, hidden_size, device=device, dtype=torch.float16)
+    if token_counts is None:
+        token_counts = list(range(1, 513))
+
+    # Create MLP weights
     w_gate = torch.randn(intermediate_size, hidden_size, device=device, dtype=torch.float16)
     w_up = torch.randn(intermediate_size, hidden_size, device=device, dtype=torch.float16)
     w_down = torch.randn(hidden_size, intermediate_size, device=device, dtype=torch.float16)
 
-    def forward():
-        # Llama-style SwiGLU MLP
-        gate = torch.nn.functional.linear(x, w_gate)
-        up = torch.nn.functional.linear(x, w_up)
-        hidden = torch.nn.functional.silu(gate) * up
-        return torch.nn.functional.linear(hidden, w_down)
+    results = []
+    for n_tokens in token_counts:
+        x = torch.randn(n_tokens, hidden_size, device=device, dtype=torch.float16)
 
-    # Warmup
-    for _ in range(num_warmup):
-        forward()
-    torch.cuda.synchronize()
+        def forward():
+            gate = torch.nn.functional.linear(x, w_gate)
+            up = torch.nn.functional.linear(x, w_up)
+            hidden = torch.nn.functional.silu(gate) * up
+            return torch.nn.functional.linear(hidden, w_down)
 
-    # Measure
-    times = []
-    for _ in range(num_runs):
+        # Warmup
+        for _ in range(num_warmup):
+            forward()
         torch.cuda.synchronize()
-        start = time.perf_counter()
-        forward()
-        torch.cuda.synchronize()
-        times.append(time.perf_counter() - start)
 
-    return np.median(times) * 1000  # ms
+        # Measure
+        times = []
+        for _ in range(num_runs):
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            forward()
+            torch.cuda.synchronize()
+            times.append(time.perf_counter() - start)
+
+        # Scale by number of layers (approximate full model)
+        latency_ms = np.median(times) * 1000 * num_layers
+        results.append((n_tokens, latency_ms))
+
+        if n_tokens % 64 == 0 or n_tokens <= 8:
+            print(f"  n={n_tokens:4d}: {latency_ms:.3f} ms")
+
+    return results
 
 
-def visualize(tokens, latencies, boundaries, output_dir):
-    """Generate visualization of latency data."""
+def visualize(tokens, latencies, model, output_dir):
+    """Generate visualization."""
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -77,23 +135,20 @@ def visualize(tokens, latencies, boundaries, output_dir):
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
 
-    # Plot 1: Raw latency
+    # Plot 1: Raw latency with boundaries
     ax1.plot(tokens, latencies, "b-", linewidth=1, alpha=0.7, label="Measured Latency")
-
-    # Mark tile boundaries
-    for b in boundaries[1:-1]:
+    for b in model.boundaries[1:-1]:
         ax1.axvline(x=b, color="r", linestyle="--", alpha=0.7, linewidth=1.5)
         ax1.annotate(f"{b}", xy=(b, max(latencies) * 0.95), ha="center", fontsize=9, color="red")
 
     ax1.set_xlabel("Token Count", fontsize=12)
     ax1.set_ylabel("Latency (ms)", fontsize=12)
-    ax1.set_title("MLP Latency vs Token Count (Tile Boundaries in Red)", fontsize=14)
+    ax1.set_title("Model Forward Latency vs Token Count (Tile Boundaries in Red)", fontsize=14)
     ax1.grid(True, alpha=0.3)
     ax1.legend()
 
     # Plot 2: Latency jump percentage
-    jumps = []
-    jump_tokens = []
+    jumps, jump_tokens = [], []
     for i in range(1, len(tokens)):
         if latencies[i - 1] > 0:
             jump = (latencies[i] - latencies[i - 1]) / latencies[i - 1] * 100
@@ -104,16 +159,14 @@ def visualize(tokens, latencies, boundaries, output_dir):
     ax2.bar(jump_tokens, jumps, width=1, color=colors, alpha=0.7)
     ax2.axhline(y=15, color="r", linestyle="--", linewidth=1.5, label="15% threshold")
     ax2.axhline(y=0, color="black", linewidth=0.5)
-
     ax2.set_xlabel("Token Count", fontsize=12)
     ax2.set_ylabel("Latency Jump (%)", fontsize=12)
-    ax2.set_title("Latency Jump Between Consecutive Token Counts (Red = >15%)", fontsize=14)
+    ax2.set_title("Latency Jump Between Consecutive Token Counts", fontsize=14)
     ax2.grid(True, alpha=0.3)
     ax2.legend()
-    ax2.set_ylim(-10, max(jumps) * 1.1 if jumps else 50)
+    ax2.set_ylim(-10, max(50, max(jumps) * 1.1) if jumps else 50)
 
     plt.tight_layout()
-
     output_path = os.path.join(output_dir, "latency_plot.png")
     plt.savefig(output_path, dpi=150)
     print(f"Saved plot to: {output_path}")
@@ -121,6 +174,18 @@ def visualize(tokens, latencies, boundaries, output_dir):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Profile model latency for tile-spec")
+    parser.add_argument("--model-path", type=str, default=None, help="HuggingFace model path (optional, uses MLP proxy if not provided)")
+    parser.add_argument("--hidden-size", type=int, default=4096, help="Hidden size (for MLP mode)")
+    parser.add_argument("--intermediate-size", type=int, default=14336, help="Intermediate size (for MLP mode)")
+    parser.add_argument("--num-layers", type=int, default=32, help="Number of layers (for MLP mode)")
+    parser.add_argument("--max-tokens", type=int, default=512, help="Max tokens to profile")
+    parser.add_argument("--output-dir", type=str, default=None, help="Output directory")
+    args = parser.parse_args()
+
+    if args.output_dir is None:
+        args.output_dir = os.path.dirname(os.path.abspath(__file__))
+
     print("=" * 60)
     print("Tile-Spec Latency Profiler")
     print("=" * 60)
@@ -130,54 +195,63 @@ def main():
         return
 
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print()
 
-    # Configuration
-    min_tokens = 1
-    max_tokens = 512
-    step = 1
+    # Token counts to profile
+    token_counts = list(range(1, args.max_tokens + 1))
 
-    token_counts = list(range(min_tokens, max_tokens + 1, step))
-
-    print(f"Profiling {len(token_counts)} token counts from {min_tokens} to {max_tokens}")
-    print("-" * 60)
-
-    # Profile
-    results = []
-    for n in token_counts:
-        lat = measure_mlp_latency(n)
-        results.append((n, lat))
-        if n % 50 == 0 or n <= 10:
-            print(f"n={n:4d}: {lat:.4f} ms")
+    if args.model_path:
+        # Load real model
+        print(f"\nLoading model: {args.model_path}")
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=torch.float16,
+            device_map="cuda",
+            trust_remote_code=True,
+        )
+        model.eval()
+        hidden_size = model.config.hidden_size
+        print(f"Hidden size: {hidden_size}")
+        print(f"\nProfiling model forward pass...")
+        print("-" * 60)
+        results = profile_model_forward(model, token_counts, hidden_size)
+    else:
+        # Use MLP proxy
+        print(f"\nNo model specified, using MLP proxy")
+        print(f"Config: hidden={args.hidden_size}, intermediate={args.intermediate_size}, layers={args.num_layers}")
+        print(f"\nProfiling MLP forward pass (scaled by {args.num_layers} layers)...")
+        print("-" * 60)
+        results = profile_mlp_latency(
+            hidden_size=args.hidden_size,
+            intermediate_size=args.intermediate_size,
+            num_layers=args.num_layers,
+            token_counts=token_counts,
+        )
 
     tokens = [r[0] for r in results]
     latencies = [r[1] for r in results]
 
     # Fit latency model
-    print()
-    print("-" * 60)
+    print("\n" + "-" * 60)
     print("Fitting PiecewiseLinearLatency model...")
     print("-" * 60)
 
-    model = PiecewiseLinearLatency()
-    model.fit(tokens, latencies, jump_threshold=0.15)
+    latency_model = PiecewiseLinearLatency()
+    latency_model.fit(tokens, latencies, jump_threshold=0.15)
 
-    print(f"Detected boundaries: {model.get_boundaries()}")
-    print(f"Optimal k candidates: {model.get_optimal_k_candidates()}")
+    print(f"Detected boundaries: {latency_model.get_boundaries()}")
+    print(f"Optimal k candidates: {latency_model.get_optimal_k_candidates()}")
 
     # Save model
-    output_dir = os.path.dirname(os.path.abspath(__file__))
-    output_path = os.path.join(output_dir, "latency_model.npz")
-    model.save(output_path)
+    output_path = os.path.join(args.output_dir, "latency_model.npz")
+    latency_model.save(output_path)
     print(f"Saved model to: {output_path}")
 
     # Generate visualization
-    print()
-    print("Generating visualization...")
-    visualize(np.array(tokens), np.array(latencies), model.boundaries, output_dir)
+    print("\nGenerating visualization...")
+    visualize(np.array(tokens), np.array(latencies), latency_model, args.output_dir)
 
-    print()
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("Profiling Complete!")
     print("=" * 60)
 
