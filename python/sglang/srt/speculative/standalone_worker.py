@@ -52,7 +52,6 @@ class StandaloneWorker(EAGLEWorker):
         self.tile_spec_profiler = None
         self.calibration = None
         self.latency_model = None
-        self._profiling_scores = None  # Temp storage for calibration during profiling
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len

@@ -261,27 +261,6 @@ class Engine(EngineBase):
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
 
-        # Run tile-spec warmup profiling if needed
-        self._run_tile_spec_warmup_if_needed()
-
-    def _run_tile_spec_warmup_if_needed(self):
-        """Run warmup requests for tile-spec profiling if needed."""
-        if not getattr(self.server_args, 'tile_spec', False):
-            return
-
-        import time
-        time.sleep(1.0)  # Small delay to let scheduler initialize
-
-        from sglang.srt.speculative.tile_spec import run_warmup
-
-        def send_request(prompts):
-            self.generate(
-                prompts if len(prompts) > 1 else prompts[0],
-                sampling_params={"temperature": 0.8, "max_new_tokens": 64},
-            )
-
-        run_warmup(self.server_args, send_request, self.tile_spec_ready)
-
     def generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
