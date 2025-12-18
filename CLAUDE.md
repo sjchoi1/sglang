@@ -111,17 +111,30 @@ Tile-aware optimization works with all three speculative decoding algorithms:
    - Fitted offline from (score, accepted) pairs
 
 2. **Latency Model** (all algorithms): Piecewise linear with automatic boundary detection
-   - Detects tile boundaries via 15% latency jumps
-   - Fits linear regression per segment
+   - Detects tile boundaries via 15% latency jumps (e.g., at 65, 129, 193, 257, 385 on A100)
+   - Stores exact boundary latencies for fast lookup
+   - Fits linear regression per segment for interpolation
 
 3. **Optimal k Selection**:
+   - **Key insight**: Search at segment END points (64, 128, 192, 256...), NOT start points
+   - This maximizes tokens before each latency jump
    - **EAGLE/STANDALONE**: Per-batch dynamic selection
      - Calibrate draft scores → acceptance probabilities
      - Sort globally by probability (descending)
      - Compute cumulative expected accepted tokens
-     - Search only tile boundaries (O(5) not O(N)) to find best E/L ratio
+     - Search only optimal k candidates (O(5) not O(N)) to find best E/L ratio
    - **NGRAM**: Static adjustment at init
-     - Snap `draft_token_num` to nearest tile boundary
+     - Snap `draft_token_num` to nearest optimal k value
+
+### A100 Tile Boundaries (Llama-8B MLP dimensions)
+
+Detected boundaries with 15% jump threshold:
+- Segment [1, 65): optimal k = 64
+- Segment [65, 129): optimal k = 128
+- Segment [129, 193): optimal k = 192
+- Segment [193, 257): optimal k = 256
+- Segment [257, 385): optimal k = 384
+- Segment [385, 513): optimal k = 512
 
 ### Calibration Dataset Considerations
 
@@ -143,15 +156,21 @@ Tile-aware optimization works with all three speculative decoding algorithms:
 
 ### Files
 
-- `tile_aware.py`: Core algorithm
+- `python/sglang/srt/speculative/tile_aware.py`: Core algorithm
   - `Calibration`: Score → probability mapping (EAGLE/STANDALONE)
-  - `PiecewiseLinearLatency`: Boundary detection + linear regression (all)
+  - `PiecewiseLinearLatency`: Boundary detection + linear regression
+  - `get_optimal_k_candidates()`: Returns segment END points for searching
   - `compute_optimal_k()`: Finds optimal draft token count
 
-- `profile_tile_aware.py`: Offline profiling script
-  - Measures verification latency at various token counts
-  - Collects calibration data
-  - Saves models as `.npz` files
+- `tilespec/`: Testing and profiling directory
+  - `test_01_latency_profiler.py`: Profile MLP latency, detect tile boundaries
+  - `test_02_piecewise_fit.py`: Verify latency model fit accuracy
+  - `test_03_collect_calibration.py`: Collect (score, accepted) calibration data
+  - `test_04_fit_calibration.py`: Fit calibration model from data
+  - `test_05_compute_optimal_k.py`: Test optimal k selection algorithm
+  - `test_06_benchmark.py`: Simulated throughput comparison
+  - `latency_model.npz`: Fitted latency model for A100
+  - `calibration.npz`: Fitted calibration model (simulated)
 
 ### Configuration
 
