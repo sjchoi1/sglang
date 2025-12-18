@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TileSpec Benchmark.
+TileSpec Benchmark - Rigorous Evaluation for ACL Submission.
 
 5 datasets for comprehensive evaluation:
 1. MT-bench (80) - multi-turn conversation
@@ -9,15 +9,18 @@ TileSpec Benchmark.
 4. Alpaca (500) - instruction following
 5. CNN/Daily Mail (500) - summarization
 
-Methodology:
-- temp=0 (deterministic)
+Methodology (following Spec-Bench ACL 2024):
+- Multiple runs (default 3) with mean ± std reporting
+- temp=0 (deterministic, greedy decoding)
+- FP16 precision
 - No max_new_tokens cap (natural EOS)
 - ShareGPT for profiling warmup
+- Hardware/software info logged
 
 Usage:
     python tile_spec/run_bench.py --configs AR Eagle3 Eagle3+TileSpec
-    python tile_spec/run_bench.py --batch-sizes 1 4 16 64
-    python tile_spec/run_bench.py --batch-sizes 1 64 128 --min-samples 512
+    python tile_spec/run_bench.py --batch-sizes 1 4 16 64 --num-runs 3
+    python tile_spec/run_bench.py --batch-sizes 1 64 128 --num-iters 30
 """
 
 import argparse
@@ -25,6 +28,9 @@ import gc
 import gzip
 import json
 import os
+import platform
+import statistics
+import subprocess
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -32,6 +38,25 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+
+
+def get_hardware_info() -> dict:
+    """Collect hardware/software info for reproducibility."""
+    info = {
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda if torch.cuda.is_available() else None,
+    }
+    if torch.cuda.is_available():
+        info["gpu_name"] = torch.cuda.get_device_name(0)
+        info["gpu_count"] = torch.cuda.device_count()
+        info["gpu_memory_gb"] = round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1)
+    try:
+        info["cpu_count"] = os.cpu_count()
+    except Exception:
+        pass
+    return info
 
 # URLs
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -299,7 +324,7 @@ def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="TileSpec Benchmark - Rigorous Evaluation")
     parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--draft", default="lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B")
     parser.add_argument("--cache-dir", default="tile_spec/data")
@@ -307,13 +332,22 @@ def main():
     parser.add_argument("--configs", nargs="+", default=["AR", "Eagle3", "Eagle3+TileSpec"])
     parser.add_argument("--datasets", nargs="+", default=["mt_bench", "humaneval", "gsm8k", "alpaca", "cnn_dm"])
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1])
-    parser.add_argument("--min-samples", type=int, default=0, help="Min samples per dataset (0=auto: batch_size*8)")
+    parser.add_argument("--num-runs", type=int, default=3, help="Number of runs for mean±std (default: 3)")
+    parser.add_argument("--num-iters", type=int, default=30, help="Number of iterations per batch size (samples = batch_size * num_iters)")
     args = parser.parse_args()
 
     cache_dir = Path(args.cache_dir)
 
+    # Collect hardware info
+    hw_info = get_hardware_info()
+    print("=" * 70)
+    print("Hardware/Software Info:")
+    for k, v in hw_info.items():
+        print(f"  {k}: {v}")
+    print("=" * 70)
+
     # Load datasets
-    print("Loading datasets...")
+    print("\nLoading datasets...")
     datasets = {}
     for name in args.datasets:
         if name in DATASETS:
@@ -328,62 +362,118 @@ def main():
         "Eagle3+TileSpec": Config("Eagle3+TileSpec", "EAGLE3", args.draft, tile_spec=True),
     }
 
-    # Run all batch sizes
-    all_results = {}  # {batch_size: {config_name: {dataset_name: Result}}}
+    # Run all batch sizes with multiple runs
+    # Structure: {batch_size: {config: {dataset: [Result, Result, ...]}}}}
+    all_runs = {}
     for batch_size in args.batch_sizes:
-        # Auto-compute min_samples: batch_size * 8 for stable measurements
-        min_samples = args.min_samples if args.min_samples > 0 else batch_size * 8
-        print(f"\n{'#'*90}\n# Batch Size: {batch_size} (min_samples={min_samples})\n{'#'*90}")
-        all_results[batch_size] = {}
-        ar_results = None
-        for name in args.configs:
-            results = run_config(all_configs[name], datasets, args.model, args.draft, cache_dir, batch_size, min_samples)
-            all_results[batch_size][name] = results
-            if name == "AR":
-                ar_results = results
-            elif ar_results:
-                for ds, r in results.items():
-                    if ds in ar_results:
-                        r.speedup = r.throughput / ar_results[ds].throughput if ar_results[ds].throughput > 0 else 1.0
+        num_samples = batch_size * args.num_iters
+        print(f"\n{'#'*90}")
+        print(f"# Batch Size: {batch_size} | Samples: {num_samples} | Runs: {args.num_runs}")
+        print(f"{'#'*90}")
 
-        # Print summary for this batch size
-        print(f"\n{'='*90}")
-        print(f"Batch Size: {batch_size}")
+        all_runs[batch_size] = {cfg: {ds: [] for ds in args.datasets} for cfg in args.configs}
+
+        for run_idx in range(args.num_runs):
+            print(f"\n--- Run {run_idx + 1}/{args.num_runs} ---")
+            ar_results = None
+
+            for cfg_name in args.configs:
+                results = run_config(
+                    all_configs[cfg_name], datasets, args.model, args.draft,
+                    cache_dir, batch_size, num_samples
+                )
+
+                # Compute speedup relative to AR
+                if cfg_name == "AR":
+                    ar_results = results
+                elif ar_results:
+                    for ds, r in results.items():
+                        if ds in ar_results and ar_results[ds].throughput > 0:
+                            r.speedup = r.throughput / ar_results[ds].throughput
+
+                # Store results
+                for ds, r in results.items():
+                    all_runs[batch_size][cfg_name][ds].append(r)
+
+        # Print summary with mean ± std
+        print(f"\n{'='*100}")
+        print(f"Results: Batch Size {batch_size} (mean ± std over {args.num_runs} runs)")
+        print(f"{'='*100}")
         print(f"{'Dataset':<12} | ", end="")
-        for name in args.configs:
-            print(f"{name:<24} | ", end="")
+        for cfg_name in args.configs:
+            print(f"{cfg_name:<28} | ", end="")
         print()
-        print("-" * 90)
+        print("-" * 100)
+
         for ds in args.datasets:
             print(f"{ds:<12} | ", end="")
-            for name in args.configs:
-                r = all_results[batch_size][name].get(ds)
-                if r:
-                    print(f"{r.speedup:>5.2f}x  τ={r.accept_length:<6.2f} | ", end="")
+            for cfg_name in args.configs:
+                runs = all_runs[batch_size][cfg_name].get(ds, [])
+                if runs:
+                    speedups = [r.speedup for r in runs]
+                    accepts = [r.accept_length for r in runs]
+                    sp_mean = statistics.mean(speedups)
+                    sp_std = statistics.stdev(speedups) if len(speedups) > 1 else 0
+                    ac_mean = statistics.mean(accepts)
+                    print(f"{sp_mean:>5.2f}x±{sp_std:<4.2f} τ={ac_mean:<5.2f} | ", end="")
                 else:
-                    print(f"{'N/A':<24} | ", end="")
+                    print(f"{'N/A':<28} | ", end="")
             print()
-        print("-" * 90)
-        print(f"{'Mean':<12} | ", end="")
-        for name in args.configs:
-            speedups = [all_results[batch_size][name][ds].speedup for ds in args.datasets if ds in all_results[batch_size][name]]
-            accepts = [all_results[batch_size][name][ds].accept_length for ds in args.datasets if ds in all_results[batch_size][name]]
-            if speedups:
-                print(f"{sum(speedups)/len(speedups):>5.2f}x  τ={sum(accepts)/len(accepts):<6.2f} | ", end="")
+
+        print("-" * 100)
+        print(f"{'Overall':<12} | ", end="")
+        for cfg_name in args.configs:
+            all_speedups = []
+            all_accepts = []
+            for ds in args.datasets:
+                runs = all_runs[batch_size][cfg_name].get(ds, [])
+                all_speedups.extend([r.speedup for r in runs])
+                all_accepts.extend([r.accept_length for r in runs])
+            if all_speedups:
+                sp_mean = statistics.mean(all_speedups)
+                sp_std = statistics.stdev(all_speedups) if len(all_speedups) > 1 else 0
+                ac_mean = statistics.mean(all_accepts)
+                print(f"{sp_mean:>5.2f}x±{sp_std:<4.2f} τ={ac_mean:<5.2f} | ", end="")
         print()
+
+    # Compute summary statistics
+    summary = {}
+    for bs in args.batch_sizes:
+        summary[bs] = {}
+        for cfg in args.configs:
+            summary[bs][cfg] = {}
+            for ds in args.datasets:
+                runs = all_runs[bs][cfg].get(ds, [])
+                if runs:
+                    speedups = [r.speedup for r in runs]
+                    accepts = [r.accept_length for r in runs]
+                    throughputs = [r.throughput for r in runs]
+                    summary[bs][cfg][ds] = {
+                        "speedup_mean": round(statistics.mean(speedups), 3),
+                        "speedup_std": round(statistics.stdev(speedups), 3) if len(speedups) > 1 else 0,
+                        "accept_length_mean": round(statistics.mean(accepts), 3),
+                        "throughput_mean": round(statistics.mean(throughputs), 1),
+                        "throughput_std": round(statistics.stdev(throughputs), 1) if len(throughputs) > 1 else 0,
+                        "num_runs": len(runs),
+                    }
 
     # Save
     Path(args.output).parent.mkdir(exist_ok=True)
-    with open(args.output, "w") as f:
-        json.dump({
-            "model": args.model, "draft": args.draft,
+    output_data = {
+        "hardware_info": hw_info,
+        "settings": {
+            "model": args.model,
+            "draft": args.draft,
+            "num_runs": args.num_runs,
+            "num_iters": args.num_iters,
             "batch_sizes": args.batch_sizes,
-            "results": {
-                bs: {n: {d: {"speedup": r.speedup, "accept_length": r.accept_length, "throughput": r.throughput}
-                         for d, r in res.items()} for n, res in cfg_results.items()}
-                for bs, cfg_results in all_results.items()
-            }
-        }, f, indent=2)
+            "datasets": args.datasets,
+            "configs": args.configs,
+        },
+        "results": summary,
+    }
+    with open(args.output, "w") as f:
+        json.dump(output_data, f, indent=2)
     print(f"\nSaved to {args.output}")
 
 
