@@ -270,48 +270,17 @@ class Engine(EngineBase):
             return
 
         import time
-        import logging
-        logger = logging.getLogger(__name__)
+        time.sleep(1.0)  # Small delay to let scheduler initialize
 
-        # Small delay to let scheduler initialize
-        time.sleep(1.0)
+        from sglang.srt.speculative.tile_spec import run_warmup
 
-        if self.tile_spec_ready():
-            logger.info("TileSpec: Already profiled (loaded from cache)")
-            return
+        def send_request(prompts):
+            self.generate(
+                prompts if len(prompts) > 1 else prompts[0],
+                sampling_params={"temperature": 0.8, "max_new_tokens": 64},
+            )
 
-        from sglang.srt.speculative.tile_spec.profiler import _load_prompts, get_cache_dir
-        import torch
-
-        logger.info("TileSpec: Running warmup profiling...")
-
-        # Load prompts for warmup
-        cache_dir = get_cache_dir(
-            self.server_args.model_path,
-            torch.cuda.get_device_name(0),
-            self.server_args.tp_size,
-        )
-        prompts = _load_prompts(cache_dir, limit=100)
-
-        # Run warmup with varying batch sizes - data recorded by scheduler's profiler
-        batch_sizes = [1, 4, 16, 64]
-        idx = 0
-        for bs in batch_sizes:
-            for _ in range(8):
-                batch = [prompts[(idx + j) % len(prompts)] for j in range(bs)]
-                idx += bs
-                try:
-                    self.generate(batch, sampling_params={"temperature": 0, "max_new_tokens": 32})
-                except Exception as e:
-                    logger.warning(f"TileSpec warmup batch failed: {e}")
-
-        # Wait for scheduler's profiler to finish (auto-finishes when enough samples)
-        for _ in range(10):
-            if self.tile_spec_ready():
-                logger.info("TileSpec: Profiling complete")
-                break
-            import time
-            time.sleep(0.5)
+        run_warmup(self.server_args, send_request, self.tile_spec_ready)
 
     def generate(
         self,

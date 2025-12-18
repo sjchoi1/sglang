@@ -1615,7 +1615,34 @@ def _execute_server_warmup(
 
     # Debug print
     # logger.info(f"warmup request returns: {res.json()=}")
+
+    # TileSpec profiling warmup (if enabled and not cached)
+    if getattr(server_args, 'tile_spec', False) and model_info["is_generation"]:
+        _run_tile_spec_warmup(url, headers, server_args)
+
     return success
+
+
+def _run_tile_spec_warmup(url: str, headers: dict, server_args: ServerArgs):
+    """Run warmup requests for TileSpec profiling if needed."""
+    from sglang.srt.speculative.tile_spec import run_warmup
+
+    def send_request(prompts):
+        json_data = {
+            "text": prompts if len(prompts) > 1 else prompts[0],
+            "sampling_params": {"temperature": 0.8, "max_new_tokens": 64},
+        }
+        res = requests.post(url + "/generate", json=json_data, headers=headers, timeout=120)
+        res.raise_for_status()
+
+    def check_ready():
+        try:
+            res = requests.get(url + "/get_server_info", timeout=10, headers=headers)
+            return res.status_code == 200 and res.json().get("tile_spec_ready", False)
+        except Exception:
+            return False
+
+    run_warmup(server_args, send_request, check_ready)
 
 
 def _wait_and_warmup(
