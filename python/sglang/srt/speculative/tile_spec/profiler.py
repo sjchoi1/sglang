@@ -1,15 +1,19 @@
 """
 Tile-Spec Profiler - Automatic profiling at engine initialization.
 
-Profiles latency by recording actual verify() calls during warmup.
-Uses real sglang generation requests for accurate profiling.
+Profiles latency and calibration by running actual sglang generation:
+- Latency: Records verify() timing at varying batch sizes
+- Calibration: Records (score, accepted) pairs from draft verification
 
+Uses ShareGPT dataset for diverse prompts.
 Cache structure: tile_spec/cache/{model}_{gpu}_{tp}/
 """
 
+import json
 import logging
 import re
 import time
+import urllib.request
 from collections import defaultdict
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -20,6 +24,9 @@ import torch
 from sglang.srt.speculative.tile_spec.core import Calibration, PiecewiseLinearLatency
 
 logger = logging.getLogger(__name__)
+
+# ShareGPT dataset URL
+SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 
 def get_cache_dir(model_path: str, gpu_name: str, tp_size: int) -> Path:
@@ -44,6 +51,47 @@ def get_cache_dir(model_path: str, gpu_name: str, tp_size: int) -> Path:
     return Path.home() / ".cache" / "sglang" / "tile_spec" / cache_name
 
 
+def _download_sharegpt(cache_dir: Path, limit: int = 500) -> List[str]:
+    """Download and extract ShareGPT prompts."""
+    sharegpt_path = cache_dir / "sharegpt.json"
+
+    if not sharegpt_path.exists():
+        logger.info("Downloading ShareGPT dataset...")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            urllib.request.urlretrieve(SHAREGPT_URL, sharegpt_path)
+        except Exception as e:
+            logger.warning(f"Failed to download ShareGPT: {e}")
+            return _get_synthetic_prompts(limit)
+
+    try:
+        with open(sharegpt_path) as f:
+            data = json.load(f)
+
+        prompts = []
+        for item in data:
+            if "conversations" in item:
+                for conv in item["conversations"]:
+                    if conv.get("from") == "human" and conv.get("value"):
+                        text = conv["value"].strip()
+                        if 50 < len(text) < 2000:
+                            prompts.append(text)
+                            if len(prompts) >= limit:
+                                return prompts
+        return prompts if prompts else _get_synthetic_prompts(limit)
+    except Exception as e:
+        logger.warning(f"Failed to load ShareGPT: {e}")
+        return _get_synthetic_prompts(limit)
+
+
+def _get_synthetic_prompts(limit: int) -> List[str]:
+    """Generate synthetic prompts as fallback."""
+    return [
+        f"Write a detailed story about adventure number {i}. Include characters, plot, and a conclusion."
+        for i in range(limit)
+    ]
+
+
 class TileSpecProfiler:
     """Profiles tile-spec latency/calibration using actual sglang runs."""
 
@@ -57,8 +105,7 @@ class TileSpecProfiler:
         self.min_samples = min_samples
 
         # Profiling state
-        self._profiling_latency = False
-        self._collecting_calibration = False
+        self._profiling = False
         self._latency_data: List[Tuple[int, float]] = []
         self._calibration_data: List[Tuple[float, bool]] = []
 
@@ -85,7 +132,6 @@ class TileSpecProfiler:
                 self.calibration = Calibration()
                 self.calibration.load(str(calibration_path))
             else:
-                # Use default calibration
                 self.calibration = Calibration()
 
             logger.info(f"Loaded tile-spec from cache: {self.cache_dir}")
@@ -101,84 +147,73 @@ class TileSpecProfiler:
         return self.latency_model is None
 
     def is_profiling(self) -> bool:
-        """Returns True if actively collecting latency data."""
-        return self._profiling_latency
-
-    def is_collecting_calibration(self) -> bool:
-        return self._collecting_calibration
+        return self._profiling
 
     def get_models(self) -> Tuple[Optional[PiecewiseLinearLatency], Optional[Calibration]]:
         return self.latency_model, self.calibration
 
     # =========================================================================
-    # Latency Profiling (during actual verify() calls)
+    # Recording during verify()
     # =========================================================================
 
     def start_profiling(self):
-        """Start collecting latency data during verify() calls."""
+        """Start collecting data during verify() calls."""
         if not self.needs_profiling():
             return
 
-        self._profiling_latency = True
+        self._profiling = True
         self._latency_data.clear()
         self._calibration_data.clear()
-        logger.info("TileSpec: Started latency profiling (recording actual verify() calls)")
+        logger.info("TileSpec: Started profiling (recording verify() calls)")
 
-    def record_latency(self, num_tokens: int, latency_ms: float):
-        """Record latency from a verify() call."""
-        if not self._profiling_latency:
+    def record(
+        self,
+        num_tokens: int,
+        latency_ms: float,
+        scores: Optional[torch.Tensor] = None,
+        accepted: Optional[torch.Tensor] = None,
+    ):
+        """Record data from a verify() call."""
+        if not self._profiling:
             return
 
+        # Record latency
         self._latency_data.append((num_tokens, latency_ms))
 
-        # Log progress periodically
-        if len(self._latency_data) % 50 == 0:
-            logger.info(f"TileSpec: Collected {len(self._latency_data)} latency samples")
+        # Record calibration data
+        if scores is not None and accepted is not None:
+            scores_np = scores.detach().cpu().numpy().flatten()
+            accepted_np = accepted.detach().cpu().numpy().flatten()
+            for s, a in zip(scores_np, accepted_np):
+                self._calibration_data.append((float(s), bool(a)))
+
+        # Log progress
+        if len(self._latency_data) % 20 == 0:
+            unique = len(set(t for t, _ in self._latency_data))
+            logger.info(
+                f"TileSpec: {len(self._latency_data)} samples, "
+                f"{unique} unique token counts, "
+                f"{len(self._calibration_data)} calibration points"
+            )
 
         # Auto-finish when we have enough diverse samples
         if len(self._latency_data) >= self.min_samples:
-            # Check we have enough unique token counts for fitting
             unique_counts = len(set(t for t, _ in self._latency_data))
-            if unique_counts >= 5:
-                self.finish_latency_profiling()
+            if unique_counts >= 5:  # Need at least 5 different token counts
+                self.finish_profiling()
 
-    def record_calibration(
-        self,
-        scores: torch.Tensor,
-        accepted: torch.Tensor,
-    ) -> bool:
-        """
-        Record calibration data from a verify() call.
-
-        Returns True if calibration collection is complete.
-        """
-        if not self._collecting_calibration:
-            return False
-
-        scores_np = scores.detach().cpu().numpy().flatten()
-        accepted_np = accepted.detach().cpu().numpy().flatten()
-
-        for s, a in zip(scores_np, accepted_np):
-            self._calibration_data.append((float(s), bool(a)))
-
-        if len(self._calibration_data) >= self.min_samples * 10:
-            self._finish_calibration()
-            return True
-
-        return False
-
-    def finish_latency_profiling(self):
-        """Finish latency profiling and fit the model."""
-        if not self._profiling_latency:
+    def finish_profiling(self):
+        """Finish profiling and fit models."""
+        if not self._profiling:
             return
 
-        self._profiling_latency = False
+        self._profiling = False
 
         if len(self._latency_data) < 10:
-            logger.warning(f"TileSpec: Only {len(self._latency_data)} samples, need more data")
+            logger.warning(f"TileSpec: Only {len(self._latency_data)} samples, need more")
             return
 
-        # Aggregate latency by token count (use median)
+        # Fit latency model
         latency_by_tokens = defaultdict(list)
         for num_tokens, latency_ms in self._latency_data:
             latency_by_tokens[num_tokens].append(latency_ms)
@@ -186,48 +221,30 @@ class TileSpecProfiler:
         token_counts = sorted(latency_by_tokens.keys())
         latencies = [np.median(latency_by_tokens[t]) for t in token_counts]
 
-        logger.info(f"TileSpec: Fitting latency model from {len(self._latency_data)} samples")
+        logger.info(f"TileSpec: Fitting from {len(self._latency_data)} samples")
         logger.info(f"  Token counts: {token_counts}")
 
-        # Fit latency model
         self.latency_model = PiecewiseLinearLatency()
         self.latency_model.fit(token_counts, latencies)
 
-        # Use default calibration for now
+        # Fit calibration model
         self.calibration = Calibration()
-
-        # Enable calibration collection for future requests
-        self._collecting_calibration = True
+        if self._calibration_data:
+            scores = np.array([s for s, _ in self._calibration_data])
+            accepted = np.array([a for _, a in self._calibration_data])
+            self.calibration.fit(scores, accepted)
+            logger.info(f"  Calibration: {len(self._calibration_data)} points")
 
         # Save to cache
         self._save_cache()
 
         logger.info("=" * 60)
-        logger.info("TileSpec: Latency profiling complete")
+        logger.info("TileSpec: Profiling complete")
         logger.info(f"  Boundaries: {self.latency_model.boundaries}")
-        logger.info(f"  Optimal k candidates: {self.latency_model.get_optimal_k_candidates()}")
-        logger.info(f"  Cache: {self.cache_dir}")
+        logger.info(f"  Optimal k: {self.latency_model.get_optimal_k_candidates()}")
         logger.info("=" * 60)
 
         self._latency_data.clear()
-
-    def _finish_calibration(self):
-        """Fit calibration model from collected data."""
-        self._collecting_calibration = False
-
-        if self._calibration_data:
-            scores = np.array([s for s, _ in self._calibration_data])
-            accepted = np.array([a for _, a in self._calibration_data])
-
-            self.calibration = Calibration()
-            self.calibration.fit(scores, accepted)
-
-            # Update cache
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            self.calibration.save(str(self.cache_dir / "calibration.npz"))
-
-            logger.info(f"TileSpec: Calibration complete ({len(self._calibration_data)} samples)")
-
         self._calibration_data.clear()
 
     def _save_cache(self):
@@ -240,65 +257,62 @@ class TileSpecProfiler:
         if self.calibration:
             self.calibration.save(str(self.cache_dir / "calibration.npz"))
 
-        logger.info(f"  Saved to cache: {self.cache_dir}")
+        logger.info(f"  Saved to: {self.cache_dir}")
 
     # =========================================================================
-    # Warmup Profiling (run at init to trigger actual model runs)
+    # Warmup profiling with batched requests
     # =========================================================================
 
-    def run_warmup_profiling(self, generate_func, num_prompts: int = 100):
+    def run_warmup_profiling(self, generate_func):
         """
-        Run warmup requests to profile latency.
+        Run warmup profiling with varying batch sizes.
 
-        This runs actual generation requests through sglang to populate
-        latency data from real verify() calls.
+        Uses batched generate() calls to get measurements at different token counts.
+        Downloads ShareGPT for diverse prompts.
 
         Args:
-            generate_func: Function to call for generation (e.g., engine.generate)
-            num_prompts: Number of prompts to run
+            generate_func: The Engine.generate() function
         """
         if not self.needs_profiling():
             return
 
         logger.info("=" * 60)
-        logger.info("TileSpec: Running warmup profiling with actual generation")
-        logger.info(f"  Will run {num_prompts} prompts")
+        logger.info("TileSpec: Running warmup profiling")
         logger.info("=" * 60)
+
+        # Download ShareGPT prompts
+        prompts = _download_sharegpt(self.cache_dir, limit=500)
+        logger.info(f"  Loaded {len(prompts)} prompts")
 
         # Start profiling
         self.start_profiling()
 
-        # Generate prompts with varying lengths for diversity
-        prompts = [
-            f"Write a short story about topic number {i}. Make it interesting and engaging."
-            for i in range(num_prompts)
-        ]
+        # Run with varying batch sizes to get different token counts
+        # batch_size * draft_tokens = total tokens in verify()
+        batch_sizes = [1, 2, 4, 8, 16, 32, 64]
+        prompt_idx = 0
 
-        # Run generation
-        for i, prompt in enumerate(prompts):
-            try:
-                generate_func(prompt, sampling_params={"temperature": 0, "max_new_tokens": 64})
-            except Exception as e:
-                logger.warning(f"Warmup request {i} failed: {e}")
+        for batch_size in batch_sizes:
+            # Run multiple batches at each size
+            num_batches = max(1, 100 // batch_size)
 
-            if (i + 1) % 20 == 0:
-                logger.info(f"TileSpec: Warmup progress {i + 1}/{num_prompts}")
+            for batch_idx in range(num_batches):
+                # Get prompts for this batch
+                batch_prompts = []
+                for _ in range(batch_size):
+                    batch_prompts.append(prompts[prompt_idx % len(prompts)])
+                    prompt_idx += 1
+
+                try:
+                    # Send batch request
+                    generate_func(
+                        batch_prompts,
+                        sampling_params={"temperature": 0, "max_new_tokens": 64},
+                    )
+                except Exception as e:
+                    logger.warning(f"Batch request failed: {e}")
+
+            logger.info(f"  Batch size {batch_size}: {num_batches} batches done")
 
         # Finish profiling
-        self.finish_latency_profiling()
-
-    # =========================================================================
-    # Legacy API (for compatibility)
-    # =========================================================================
-
-    def record(
-        self,
-        num_tokens: int,
-        latency_ms: float,
-        scores: Optional[torch.Tensor] = None,
-        accepted: Optional[torch.Tensor] = None,
-    ):
-        """Legacy: Record verification sample."""
-        self.record_latency(num_tokens, latency_ms)
-        if scores is not None and accepted is not None:
-            self.record_calibration(scores, accepted)
+        self.finish_profiling()

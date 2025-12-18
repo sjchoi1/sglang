@@ -786,7 +786,8 @@ class EAGLEWorker(TpModelWorker):
             torch.cuda.synchronize()
             latency_ms = (time.perf_counter() - _profile_start) * 1000
             num_tokens = spec_info.draft_token_num * len(batch.seq_lens)
-            self.tile_spec_profiler.record_latency(num_tokens, latency_ms)
+            # Note: Calibration scores not currently passed (would need changes to draft path)
+            self.tile_spec_profiler.record(num_tokens, latency_ms)
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
@@ -1118,28 +1119,18 @@ class EAGLEWorker(TpModelWorker):
         if self.latency_model:
             logger.info(f"Tile-spec loaded from cache: {self.latency_model.boundaries}")
         else:
-            # Start profiling - will collect latency during actual verify() calls
-            logger.info("TileSpec: No cache found, will profile during warmup requests")
+            # Start profiling - will collect data during verify() calls
+            logger.info("TileSpec: No cache found, starting profiling")
             self.tile_spec_profiler.start_profiling()
 
-    def run_tile_spec_profiling(self, generate_func, num_prompts: int = 100):
-        """
-        Run warmup requests to profile tile-spec latency.
-
-        Should be called after engine is fully initialized.
-
-        Args:
-            generate_func: Function to generate text (e.g., engine.generate)
-            num_prompts: Number of warmup prompts to run
-        """
+    def finish_tile_spec_profiling(self):
+        """Finish tile-spec profiling and update models."""
         if not self.enable_tile_spec or not self.tile_spec_profiler:
             return
 
-        if not self.tile_spec_profiler.needs_profiling():
-            return
-
-        self.tile_spec_profiler.run_warmup_profiling(generate_func, num_prompts)
-        self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
+        if self.tile_spec_profiler.is_profiling():
+            self.tile_spec_profiler.finish_profiling()
+            self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
 
 
 @torch.compile(dynamic=True, disable=_is_npu)

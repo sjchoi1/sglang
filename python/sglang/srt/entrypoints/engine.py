@@ -273,26 +273,50 @@ class Engine(EngineBase):
         if self.tile_spec_ready():
             return  # Already profiled (loaded from cache)
 
+        # Import here to avoid circular import
+        from sglang.srt.speculative.tile_spec.profiler import _download_sharegpt, get_cache_dir
+
         logger.info("=" * 60)
-        logger.info("TileSpec: Running warmup profiling with actual generation")
+        logger.info("TileSpec: Running warmup profiling with batched requests")
         logger.info("=" * 60)
 
-        # Run warmup requests to trigger profiling
-        num_prompts = 100
-        for i in range(num_prompts):
-            try:
-                prompt = f"Write a short story about topic number {i}. Make it interesting."
-                self.generate(prompt, sampling_params={"temperature": 0, "max_new_tokens": 64})
-            except Exception as e:
-                logger.warning(f"Warmup request {i} failed: {e}")
+        # Download ShareGPT prompts for diversity
+        import torch
+        cache_dir = get_cache_dir(
+            self.server_args.model_path,
+            torch.cuda.get_device_name(0),
+            self.server_args.tp_size,
+        )
+        prompts = _download_sharegpt(cache_dir, limit=500)
+        logger.info(f"  Loaded {len(prompts)} ShareGPT prompts")
 
-            if (i + 1) % 20 == 0:
-                logger.info(f"TileSpec: Warmup progress {i + 1}/{num_prompts}")
+        # Run with varying batch sizes to get different token counts
+        # batch_size * draft_tokens = total tokens in verify()
+        batch_sizes = [1, 2, 4, 8, 16, 32, 64]
+        prompt_idx = 0
 
-            # Check if profiling is complete (enough samples collected)
+        for batch_size in batch_sizes:
+            # Skip if already complete
             if self.tile_spec_ready():
-                logger.info(f"TileSpec: Profiling complete after {i + 1} requests")
                 break
+
+            num_batches = max(1, 100 // batch_size)
+            for _ in range(num_batches):
+                batch_prompts = [
+                    prompts[(prompt_idx + j) % len(prompts)]
+                    for j in range(batch_size)
+                ]
+                prompt_idx += batch_size
+
+                try:
+                    self.generate(
+                        batch_prompts,
+                        sampling_params={"temperature": 0, "max_new_tokens": 64},
+                    )
+                except Exception as e:
+                    logger.warning(f"Batch request failed: {e}")
+
+            logger.info(f"  Batch size {batch_size}: done")
 
         logger.info("TileSpec: Warmup profiling complete")
 
