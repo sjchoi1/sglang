@@ -232,6 +232,8 @@ class TileSpecProfiler:
             seq_lens = torch.tensor([num_tokens], dtype=torch.int32, device=device)
             out_cache_loc = torch.zeros(num_tokens, dtype=torch.int64, device=device)
             positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+            prefix_lens = torch.zeros(1, dtype=torch.int32, device=device)
+            extend_seq_lens = torch.tensor([num_tokens], dtype=torch.int32, device=device)
 
             # Create ForwardBatch for decode (verification uses decode path)
             forward_batch = ForwardBatch(
@@ -248,6 +250,8 @@ class TileSpecProfiler:
                 return_logprob=False,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 positions=positions,
+                prefix_lens=prefix_lens,
+                extend_seq_lens=extend_seq_lens,
             )
 
             # Warmup
