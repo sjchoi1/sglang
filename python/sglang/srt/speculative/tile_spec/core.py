@@ -1,15 +1,15 @@
 """
-Tile-aware dynamic speculation for speculative decoding.
+Core tile-aware speculation algorithms.
 
-This module provides:
 - Calibration: maps cumulative draft scores to acceptance probabilities
 - PiecewiseLinearLatency: models verification latency with tile boundaries
 - compute_optimal_k: finds optimal draft token count maximizing E/Latency
 """
 
-from typing import List, Tuple, Optional
-import torch
+from typing import List
+
 import numpy as np
+import torch
 
 
 class Calibration:
@@ -50,8 +50,8 @@ class Calibration:
 
     def load(self, path: str):
         data = np.load(path)
-        self.bin_edges = data['bin_edges']
-        self.bin_probs = data['bin_probs']
+        self.bin_edges = data["bin_edges"]
+        self.bin_probs = data["bin_probs"]
         self.num_bins = len(self.bin_probs)
         self._tensor_probs = None
 
@@ -60,27 +60,14 @@ class PiecewiseLinearLatency:
     """
     Latency model with automatic boundary detection.
 
-    Supports two modes:
-    - Piecewise linear: fits linear regression per segment (default)
-    - LUT: stores exact latency values for all measured token counts
-
-    When use_lut=True, predict() returns exact measured values when available,
-    and falls back to piecewise linear interpolation for unmeasured counts.
+    Detects tile boundaries via latency jumps and fits linear regression
+    per segment for interpolation.
     """
 
-    def __init__(self, use_lut: bool = False):
-        """
-        Args:
-            use_lut: If True, store exact latencies and use them for prediction.
-                     Falls back to piecewise linear for unmeasured token counts.
-        """
-        self.use_lut = use_lut
+    def __init__(self):
         self.boundaries: List[int] = []
         self.slopes: List[float] = []
         self.intercepts: List[float] = []
-        # LUT: exact latencies at measured token counts
-        self.lut: dict = {}  # token_count -> latency
-        # Store boundary latencies separately for fast lookup
         self.boundary_latencies: dict = {}  # boundary -> latency
 
     def fit(
@@ -102,25 +89,19 @@ class PiecewiseLinearLatency:
         tokens = np.array([p[0] for p in sorted_pairs])
         lats = np.array([p[1] for p in sorted_pairs])
 
-        # Store LUT if enabled
-        if self.use_lut:
-            self.lut = {int(t): float(l) for t, l in zip(tokens, lats)}
-
         # Detect boundaries
         self.boundaries = [int(tokens[0])]
         for i in range(1, len(tokens)):
-            if lats[i-1] > 0 and (lats[i] - lats[i-1]) / lats[i-1] > jump_threshold:
+            if lats[i - 1] > 0 and (lats[i] - lats[i - 1]) / lats[i - 1] > jump_threshold:
                 self.boundaries.append(int(tokens[i]))
         self.boundaries.append(int(tokens[-1]) + 1)
 
-        # Store boundary latencies (optimal k values = boundaries[:-1])
-        # For each boundary, store the latency at that exact token count
+        # Store boundary latencies for fast lookup
         for b in self.boundaries[:-1]:
             idx = np.where(tokens == b)[0]
             if len(idx) > 0:
                 self.boundary_latencies[b] = float(lats[idx[0]])
             elif b > 0:
-                # Find closest measured point at or below boundary
                 below = tokens[tokens <= b]
                 if len(below) > 0:
                     closest_idx = np.argmax(below)
@@ -147,19 +128,10 @@ class PiecewiseLinearLatency:
             self.intercepts.append(float(intercept))
 
     def predict(self, n: int) -> float:
-        """
-        Predict latency for n tokens.
-
-        If use_lut=True and n is in LUT, returns exact value.
-        Otherwise uses piecewise linear interpolation.
-        """
+        """Predict latency for n tokens."""
         # Check boundary latencies first (fast path for optimal k search)
         if n in self.boundary_latencies:
             return self.boundary_latencies[n]
-
-        # Check LUT if enabled
-        if self.use_lut and n in self.lut:
-            return self.lut[n]
 
         # Fall back to piecewise linear
         for i in range(len(self.boundaries) - 1):
@@ -185,7 +157,6 @@ class PiecewiseLinearLatency:
         Example: boundaries = [1, 65, 129, 193, 257, 385, 513]
         Returns: [64, 128, 192, 256, 384, 512]
         """
-        # Skip the first boundary (usually 1) and return boundary[i] - 1
         candidates = [b - 1 for b in self.boundaries[1:]]
         return candidates
 
@@ -195,29 +166,19 @@ class PiecewiseLinearLatency:
             boundaries=self.boundaries,
             slopes=self.slopes,
             intercepts=self.intercepts,
-            use_lut=self.use_lut,
-            lut_keys=list(self.lut.keys()) if self.lut else [],
-            lut_values=list(self.lut.values()) if self.lut else [],
             boundary_latencies_keys=list(self.boundary_latencies.keys()),
             boundary_latencies_values=list(self.boundary_latencies.values()),
         )
 
     def load(self, path: str):
         data = np.load(path)
-        self.boundaries = data['boundaries'].tolist()
-        self.slopes = data['slopes'].tolist()
-        self.intercepts = data['intercepts'].tolist()
-        self.use_lut = bool(data.get('use_lut', False))
-
-        # Load LUT if present
-        lut_keys = data.get('lut_keys', [])
-        lut_values = data.get('lut_values', [])
-        if len(lut_keys) > 0:
-            self.lut = {int(k): float(v) for k, v in zip(lut_keys, lut_values)}
+        self.boundaries = data["boundaries"].tolist()
+        self.slopes = data["slopes"].tolist()
+        self.intercepts = data["intercepts"].tolist()
 
         # Load boundary latencies
-        bl_keys = data.get('boundary_latencies_keys', [])
-        bl_values = data.get('boundary_latencies_values', [])
+        bl_keys = data.get("boundary_latencies_keys", [])
+        bl_values = data.get("boundary_latencies_values", [])
         if len(bl_keys) > 0:
             self.boundary_latencies = {int(k): float(v) for k, v in zip(bl_keys, bl_values)}
 

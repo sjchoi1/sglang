@@ -46,7 +46,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
-from sglang.srt.speculative.tile_aware import (
+from sglang.srt.speculative.tile_spec import (
     Calibration,
     PiecewiseLinearLatency,
     compute_optimal_k,
