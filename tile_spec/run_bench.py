@@ -311,14 +311,9 @@ def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir
     # Run datasets
     results = {}
     for name, samples in datasets.items():
-        # Adjust samples to target count (cycle up or truncate down)
-        orig_len = len(samples)
-        if min_samples > 0 and orig_len != min_samples:
+        if min_samples > 0 and len(samples) != min_samples:
             samples = cycle_samples(samples, min_samples)
-            action = "cycled" if orig_len < min_samples else "truncated"
-            print(f"\n  [{name}] {len(samples)} samples ({action} from {orig_len})")
-        else:
-            print(f"\n  [{name}] {len(samples)} samples...")
+        print(f"\n  [{name}] {len(samples)} samples")
         result = run_dataset(engine, samples, name)
         results[name] = result
         print(f"    {result.throughput:.1f} tok/s, τ={result.accept_length:.2f}")
