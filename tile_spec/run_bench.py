@@ -304,32 +304,22 @@ def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir
     sharegpt = load_sharegpt(cache_dir, limit=500)
 
     if config.tile_spec:
-        # First: create engine with default max_running_requests for profiling
+        # Create engine with default max_running_requests for profiling
         engine = sgl.Engine(**kwargs)
 
-        # Profiling with ShareGPT (if not cached)
-        if not engine.tile_spec_ready():
-            print("Profiling with ShareGPT...")
-            count = 0
-            while not engine.tile_spec_ready() and count < len(sharegpt):
-                engine.generate(sharegpt[count], sampling_params={"temperature": 0})
-                count += 1
-            print(f"  Profiling complete after {count} prompts")
-        else:
-            print("  Using cached tile-spec profile")
+        # Profiling with ShareGPT
+        print("Profiling with ShareGPT...")
+        for prompt in sharegpt:
+            engine.generate(prompt, sampling_params={"temperature": 0})
 
         # Restart engine with target batch_size for benchmarking
-        print(f"  Restarting engine with batch_size={batch_size}...")
+        print(f"Restarting engine with batch_size={batch_size}...")
         engine.shutdown()
         del engine
         gc.collect()
         torch.cuda.empty_cache()
         kwargs["max_running_requests"] = batch_size
         engine = sgl.Engine(**kwargs)
-
-        # Warmup
-        for prompt in sharegpt[:10]:
-            engine.generate(prompt, sampling_params={"temperature": 0})
     else:
         engine = sgl.Engine(**kwargs)
         print("Warmup with 10 ShareGPT prompts...")
