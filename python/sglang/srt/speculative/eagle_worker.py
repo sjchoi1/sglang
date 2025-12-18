@@ -47,8 +47,6 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
 )
 from sglang.srt.speculative.tile_spec import (
-    Calibration,
-    PiecewiseLinearLatency,
     TileSpecProfiler,
     compute_optimal_k,
 )

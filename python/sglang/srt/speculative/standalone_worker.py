@@ -12,11 +12,6 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
-from sglang.srt.speculative.tile_spec import (
-    Calibration,
-    PiecewiseLinearLatency,
-    TileSpecProfiler,
-)
 from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 
 if is_cuda():
