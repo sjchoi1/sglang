@@ -208,7 +208,11 @@ class TileSpecProfiler:
 
         Uses the same ForwardBatch infrastructure as CUDA graph capture.
         """
-        from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardBatch,
+            ForwardMode,
+            CaptureHiddenMode,
+        )
 
         logger.info("Profiling verification latency...")
 
@@ -241,6 +245,7 @@ class TileSpecProfiler:
                 token_to_kv_pool=model_runner.token_to_kv_pool,
                 attn_backend=model_runner.attn_backend,
                 return_logprob=False,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
             )
 
             # Warmup
