@@ -281,7 +281,11 @@ def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir
     """Run all datasets for a config."""
     import sglang as sgl
 
-    kwargs = {"model_path": model, "dtype": "float16", "max_running_requests": batch_size}
+    # For TileSpec profiling, need high max_running_requests to vary batch sizes
+    # After profiling (cached), we use the target batch_size for benchmarking
+    profiling_max_reqs = 128 if config.tile_spec else batch_size
+
+    kwargs = {"model_path": model, "dtype": "float16", "max_running_requests": profiling_max_reqs}
     if config.speculative_algorithm:
         kwargs.update({
             "speculative_algorithm": config.speculative_algorithm,
@@ -301,15 +305,42 @@ def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir
     sharegpt_iter = iter(sharegpt)
 
     if config.tile_spec:
-        print("Profiling with ShareGPT (waiting for tile_spec_ready)...")
-        count = 0
-        while not engine.tile_spec_ready():
-            prompt = next(sharegpt_iter, None)
-            if prompt is None:
-                break
-            engine.generate(prompt, sampling_params={"temperature": 0})
-            count += 1
-        print(f"  Profiling complete after {count} prompts")
+        # Check if profiling needed (not cached)
+        if not engine.tile_spec_ready():
+            print("Profiling with ShareGPT (waiting for tile_spec_ready)...")
+            print("  Sending concurrent requests for batch size variation...")
+            import concurrent.futures
+
+            count = 0
+            prompts = list(sharegpt_iter)
+
+            # Send concurrent requests to vary batch sizes (needed for latency curve)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+                while not engine.tile_spec_ready() and count < len(prompts):
+                    # Submit batch of requests concurrently
+                    batch_end = min(count + 32, len(prompts))
+                    futures = [
+                        executor.submit(engine.generate, prompts[i], {"temperature": 0})
+                        for i in range(count, batch_end)
+                    ]
+                    concurrent.futures.wait(futures)
+                    count = batch_end
+            print(f"  Profiling complete after {count} prompts")
+
+            # Restart engine with target batch_size for fair benchmarking
+            if profiling_max_reqs != batch_size:
+                print(f"  Restarting engine with batch_size={batch_size} for benchmark...")
+                engine.shutdown()
+                del engine
+                gc.collect()
+                torch.cuda.empty_cache()
+                kwargs["max_running_requests"] = batch_size
+                engine = sgl.Engine(**kwargs)
+        else:
+            print("  Using cached tile-spec profile")
+            # Warmup only
+            for prompt in list(sharegpt_iter)[:10]:
+                engine.generate(prompt, sampling_params={"temperature": 0})
     else:
         print("Warmup with 10 ShareGPT prompts...")
         for prompt in list(sharegpt_iter)[:10]:
