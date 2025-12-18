@@ -1123,15 +1123,6 @@ class EAGLEWorker(TpModelWorker):
             logger.info("TileSpec: No cache found, starting profiling")
             self.tile_spec_profiler.start_profiling()
 
-    def finish_tile_spec_profiling(self):
-        """Finish tile-spec profiling and update models."""
-        if not self.enable_tile_spec or not self.tile_spec_profiler:
-            return
-
-        if self.tile_spec_profiler.is_profiling():
-            self.tile_spec_profiler.finish_profiling()
-            self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
-
 
 @torch.compile(dynamic=True, disable=_is_npu)
 def get_last_loc_large_page_size_top_k_1(
