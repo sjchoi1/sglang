@@ -2376,11 +2376,8 @@ class Scheduler(
         if hasattr(self, "draft_worker") and self.draft_worker is not None:
             profiler = getattr(self.draft_worker, "tile_spec_profiler", None)
             if profiler is not None:
-                # Ready if latency model exists and not collecting calibration
-                ret["tile_spec_ready"] = (
-                    profiler.latency_model is not None
-                    and not profiler.is_collecting_calibration()
-                )
+                # Ready when latency model exists (calibration can continue in background)
+                ret["tile_spec_ready"] = profiler.latency_model is not None
             else:
                 ret["tile_spec_ready"] = True  # No profiler = ready
         else:

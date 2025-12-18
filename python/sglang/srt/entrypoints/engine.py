@@ -261,6 +261,41 @@ class Engine(EngineBase):
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
 
+        # Run tile-spec warmup profiling if needed
+        self._run_tile_spec_warmup_if_needed()
+
+    def _run_tile_spec_warmup_if_needed(self):
+        """Run warmup requests for tile-spec profiling if needed."""
+        if not getattr(self.server_args, 'tile_spec', False):
+            return
+
+        # Check if profiling is needed
+        if self.tile_spec_ready():
+            return  # Already profiled (loaded from cache)
+
+        logger.info("=" * 60)
+        logger.info("TileSpec: Running warmup profiling with actual generation")
+        logger.info("=" * 60)
+
+        # Run warmup requests to trigger profiling
+        num_prompts = 100
+        for i in range(num_prompts):
+            try:
+                prompt = f"Write a short story about topic number {i}. Make it interesting."
+                self.generate(prompt, sampling_params={"temperature": 0, "max_new_tokens": 64})
+            except Exception as e:
+                logger.warning(f"Warmup request {i} failed: {e}")
+
+            if (i + 1) % 20 == 0:
+                logger.info(f"TileSpec: Warmup progress {i + 1}/{num_prompts}")
+
+            # Check if profiling is complete (enough samples collected)
+            if self.tile_spec_ready():
+                logger.info(f"TileSpec: Profiling complete after {i + 1} requests")
+                break
+
+        logger.info("TileSpec: Warmup profiling complete")
+
     def generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
