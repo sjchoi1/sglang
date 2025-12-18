@@ -1,6 +1,6 @@
 #!/bin/bash
 # TileSpec Docker Environment
-# Usage: ./tilespec/docker_run.sh [sglang_path]
+# Usage: ./tile_spec/run_docker.sh [sglang_path]
 
 SGLANG_PATH="${1:-/datadisk/sglang}"
 
@@ -9,7 +9,8 @@ echo "Mounting: $SGLANG_PATH -> /workspace/sglang"
 
 docker run --gpus all -it --rm \
   -v "$SGLANG_PATH":/workspace/sglang \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
   -w /workspace/sglang \
   --shm-size=16g \
   lmsysorg/sglang:latest \
-  bash
+  bash -c "pip install -e 'python[dev]' && exec bash"
