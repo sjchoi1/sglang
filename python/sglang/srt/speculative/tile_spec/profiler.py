@@ -81,6 +81,7 @@ class TileSpecProfiler:
         self.min_samples = min_samples
         self._profiling = False
         self._latency_data: List[Tuple[int, float]] = []
+        self._calibration_data: List[Tuple[float, bool]] = []
 
         self.latency_model: Optional[PiecewiseLinearLatency] = None
         self.calibration: Optional[Calibration] = None
@@ -121,13 +122,21 @@ class TileSpecProfiler:
             return
         self._profiling = True
         self._latency_data.clear()
+        self._calibration_data.clear()
         logger.info("TileSpec: Started profiling")
 
-    def record(self, num_tokens: int, latency_ms: float):
-        """Record latency from verify() call."""
+    def record(self, num_tokens: int, latency_ms: float, scores=None, accepted=None):
+        """Record latency and calibration data from verify() call."""
         if not self._profiling:
             return
         self._latency_data.append((num_tokens, latency_ms))
+
+        # Collect calibration data (score, accepted) pairs
+        if scores is not None and accepted is not None:
+            scores_np = scores.detach().cpu().numpy().flatten()
+            accepted_np = accepted.detach().cpu().numpy().flatten()
+            for s, a in zip(scores_np, accepted_np):
+                self._calibration_data.append((float(s), bool(a)))
 
         # Auto-finish when enough diverse samples
         if len(self._latency_data) >= self.min_samples:
@@ -158,7 +167,14 @@ class TileSpecProfiler:
 
         self.latency_model = PiecewiseLinearLatency()
         self.latency_model.fit(token_counts, latencies)
-        self.calibration = Calibration()  # Default calibration
+
+        # Fit calibration from collected data
+        self.calibration = Calibration()
+        if self._calibration_data:
+            cal_scores = np.array([s for s, _ in self._calibration_data])
+            cal_accepted = np.array([a for _, a in self._calibration_data])
+            self.calibration.fit(cal_scores, cal_accepted)
+            logger.info(f"  Calibration: {len(self._calibration_data)} samples")
 
         # Save cache
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -167,6 +183,7 @@ class TileSpecProfiler:
 
         logger.info(f"TileSpec: Complete, boundaries={self.latency_model.boundaries}")
         self._latency_data.clear()
+        self._calibration_data.clear()
 
     def run_warmup(self, generate_func):
         """Run warmup profiling with varying batch sizes."""

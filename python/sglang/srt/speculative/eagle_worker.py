@@ -111,7 +111,7 @@ class EAGLEWorker(TpModelWorker):
         self.tile_spec_profiler = None
         self.calibration = None
         self.latency_model = None
-        # Profiling will be done after init via init_tile_spec() called by scheduler
+        self._profiling_scores = None  # Temp storage for calibration during profiling
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -682,6 +682,11 @@ class EAGLEWorker(TpModelWorker):
         else:
             num_draft_tokens = self.speculative_num_draft_tokens
 
+        # Store scores for calibration during profiling
+        if self.enable_tile_spec and self.tile_spec_profiler and self.tile_spec_profiler.is_profiling():
+            scores_cat = torch.cat(score_list, dim=1).flatten(1)
+            self._profiling_scores = scores_cat[:, :num_draft_tokens]  # [bs, num_draft_tokens]
+
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, num_draft_tokens
         )
@@ -781,13 +786,24 @@ class EAGLEWorker(TpModelWorker):
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
 
-        # Tile-spec profiling: record latency from actual verify() call
+        # Tile-spec profiling: record latency and calibration data
         if _profile_start is not None:
             torch.cuda.synchronize()
             latency_ms = (time.perf_counter() - _profile_start) * 1000
             num_tokens = spec_info.draft_token_num * len(batch.seq_lens)
-            # Note: Calibration scores not currently passed (would need changes to draft path)
-            self.tile_spec_profiler.record(num_tokens, latency_ms)
+
+            # Build accepted mask for calibration [bs, draft_token_num]
+            scores = self._profiling_scores
+            accepted = None
+            if scores is not None:
+                bs = len(res.accept_length_per_req_cpu)
+                draft_k = spec_info.draft_token_num
+                accepted = torch.zeros(bs, draft_k, dtype=torch.bool, device=scores.device)
+                for i, acc_len in enumerate(res.accept_length_per_req_cpu):
+                    accepted[i, :acc_len] = True
+                self._profiling_scores = None  # Clear after use
+
+            self.tile_spec_profiler.record(num_tokens, latency_ms, scores, accepted)
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
