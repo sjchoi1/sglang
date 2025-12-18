@@ -527,6 +527,23 @@ class Engine(EngineBase):
             "version": __version__,
         }
 
+    def tile_spec_ready(self) -> bool:
+        """Check if tile-spec profiling is complete.
+
+        Returns True if:
+        - tile_spec is not enabled
+        - profiling has finished (enough samples collected)
+        - models are loaded from cache
+        """
+        internal_states = self.loop.run_until_complete(
+            self.tokenizer_manager.get_internal_state()
+        )
+        # Check all DP ranks (usually just one)
+        for state in internal_states:
+            if not state.get("tile_spec_ready", True):
+                return False
+        return True
+
     def init_weights_update_group(
         self,
         master_address: str,

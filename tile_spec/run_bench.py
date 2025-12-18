@@ -248,10 +248,23 @@ def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir
     engine = sgl.Engine(**kwargs)
 
     # Warmup with ShareGPT (also does profiling for tile-spec)
-    sharegpt = load_sharegpt(cache_dir, limit=150 if config.tile_spec else 10)
-    print(f"Warmup with {len(sharegpt)} ShareGPT prompts...")
-    for prompt in sharegpt:
-        engine.generate(prompt, sampling_params={"temperature": 0})
+    sharegpt = load_sharegpt(cache_dir, limit=500)
+    sharegpt_iter = iter(sharegpt)
+
+    if config.tile_spec:
+        print("Profiling with ShareGPT (waiting for tile_spec_ready)...")
+        count = 0
+        while not engine.tile_spec_ready():
+            prompt = next(sharegpt_iter, None)
+            if prompt is None:
+                break
+            engine.generate(prompt, sampling_params={"temperature": 0})
+            count += 1
+        print(f"  Profiling complete after {count} prompts")
+    else:
+        print("Warmup with 10 ShareGPT prompts...")
+        for prompt in list(sharegpt_iter)[:10]:
+            engine.generate(prompt, sampling_params={"temperature": 0})
 
     # Run datasets
     results = {}

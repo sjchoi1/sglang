@@ -2372,6 +2372,16 @@ class Scheduler(
                 self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
             )
 
+        # Tile-spec profiler status
+        if hasattr(self, "draft_worker") and self.draft_worker is not None:
+            profiler = getattr(self.draft_worker, "tile_spec_profiler", None)
+            if profiler is not None:
+                ret["tile_spec_ready"] = not profiler.is_profiling()
+            else:
+                ret["tile_spec_ready"] = True  # No profiler = ready
+        else:
+            ret["tile_spec_ready"] = True  # No draft worker = ready
+
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
 
