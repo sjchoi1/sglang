@@ -12,7 +12,9 @@ from sglang.srt.speculative.tile_spec.core import (
 )
 from sglang.srt.speculative.tile_spec.profiler import (
     TileSpecProfiler,
+    download_sharegpt,
     get_cache_dir,
+    load_sharegpt_prompts,
 )
 
 __all__ = [
@@ -20,5 +22,7 @@ __all__ = [
     "PiecewiseLinearLatency",
     "compute_optimal_k",
     "TileSpecProfiler",
+    "download_sharegpt",
     "get_cache_dir",
+    "load_sharegpt_prompts",
 ]

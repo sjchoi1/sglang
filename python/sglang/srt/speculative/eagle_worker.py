@@ -716,6 +716,12 @@ class EAGLEWorker(TpModelWorker):
                 spec_info.retrive_next_token.shape
             ).cpu()
 
+        # Tile-spec profiling: measure actual verification latency
+        _profile_start = None
+        if self.enable_tile_spec and self.tile_spec_profiler and self.tile_spec_profiler.is_profiling():
+            torch.cuda.synchronize()
+            _profile_start = time.perf_counter()
+
         # Forward
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
@@ -774,6 +780,22 @@ class EAGLEWorker(TpModelWorker):
 
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
+
+        # Tile-spec profiling: record verification data
+        if _profile_start is not None:
+            torch.cuda.synchronize()
+            latency_ms = (time.perf_counter() - _profile_start) * 1000
+            num_tokens = spec_info.draft_token_num * len(batch.seq_lens)
+            self.tile_spec_profiler.record_verification(
+                num_tokens=num_tokens,
+                latency_ms=latency_ms,
+                # TODO: add calibration scores and accepted once extracted from res
+            )
+            # Check if profiling is complete
+            if not self.tile_spec_profiler.is_profiling():
+                self.tile_spec_profiler.finish_profiling()
+                self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
+                logger.info(f"Tile-spec profiling complete. Boundaries: {self.latency_model.get_boundaries()}")
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
@@ -1097,86 +1119,20 @@ class EAGLEWorker(TpModelWorker):
         if not self.enable_tile_spec:
             return
 
-        logger.info("Initializing tile-spec profiling...")
+        logger.info("Initializing tile-spec...")
         self.tile_spec_profiler = TileSpecProfiler(self.server_args)
 
-        # Get models (from cache or None if need online profiling)
+        # Get models from cache
         self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
 
         if self.latency_model:
             logger.info(f"Tile-spec loaded from cache with boundaries: {self.latency_model.get_boundaries()}")
         else:
-            # No cache - run automatic warmup profiling
-            logger.info("No tile-spec cache found - running warmup profiling...")
-            self._run_tile_spec_warmup()
-            self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
-            if self.latency_model:
-                logger.info(f"Tile-spec warmup complete. Boundaries: {self.latency_model.get_boundaries()}")
-
-    def _run_tile_spec_warmup(self, max_tokens: int = 512, num_runs: int = 5):
-        """Run warmup profiling to measure verification latency."""
-        from sglang.srt.speculative.tile_spec.core import PiecewiseLinearLatency
-
-        logger.info(f"Profiling verification latency (1 to {max_tokens} tokens)...")
-
-        device = self.target_worker.device
-        model_runner = self.target_worker.model_runner
-        graph_runner = model_runner.graph_runner
-
-        # Use existing CUDA graph capture batch sizes as profiling points
-        if graph_runner and hasattr(graph_runner, 'capture_bs'):
-            token_counts = sorted(set(graph_runner.capture_bs))
-            token_counts = [t for t in token_counts if t <= max_tokens]
-        else:
-            # Fallback: sample key points around tile boundaries
-            token_counts = [1, 32, 64, 65, 128, 129, 192, 193, 256, 257, 384, 385, 512]
-            token_counts = [t for t in token_counts if t <= max_tokens]
-
-        latencies = []
-        for num_tokens in token_counts:
-            # Warmup
-            for _ in range(2):
-                torch.cuda.synchronize()
-                # Use graph runner replay if available, otherwise skip
-                if graph_runner and num_tokens in graph_runner.capture_bs:
-                    pass  # Graph already captured
-
-            # Measure using simple matmul as proxy for MLP compute
-            # This approximates verification latency
-            times = []
-            hidden_size = model_runner.model_config.hidden_size
-            intermediate_size = getattr(model_runner.model_config, 'intermediate_size', hidden_size * 4)
-
-            x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.float16)
-            w = torch.randn(intermediate_size, hidden_size, device=device, dtype=torch.float16)
-
-            for _ in range(num_runs):
-                torch.cuda.synchronize()
-                start = time.perf_counter()
-                # Simulate MLP forward (dominant compute in verification)
-                _ = torch.mm(x, w.t())
-                torch.cuda.synchronize()
-                times.append((time.perf_counter() - start) * 1000)
-
-            latency_ms = min(times)  # Use min to reduce noise
-            latencies.append(latency_ms)
-
-            if num_tokens % 64 == 0 or num_tokens in [1, 65, 129, 193, 257]:
-                logger.info(f"  n={num_tokens}: {latency_ms:.3f} ms")
-
-        # Fit latency model
-        latency_model = PiecewiseLinearLatency()
-        latency_model.fit(token_counts, latencies)
-
-        # Save to cache (calibration will be default/placeholder for now)
-        from sglang.srt.speculative.tile_spec.core import Calibration
-        calibration = Calibration()
-
-        self.tile_spec_profiler.cache_dir.mkdir(parents=True, exist_ok=True)
-        latency_model.save(str(self.tile_spec_profiler.cache_dir / "latency_model.npz"))
-        calibration.save(str(self.tile_spec_profiler.cache_dir / "calibration.npz"))
-
-        logger.info(f"Saved tile-spec models to {self.tile_spec_profiler.cache_dir}")
+            # No cache - start online profiling mode
+            # Profiling will happen during actual verify() calls
+            logger.info("No tile-spec cache found - starting online profiling...")
+            logger.info("Run warmup with: python -m sglang.srt.speculative.tile_spec.warmup")
+            self.tile_spec_profiler.start_profiling(min_samples=100)
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
