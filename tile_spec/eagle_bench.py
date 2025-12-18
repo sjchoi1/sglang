@@ -5,11 +5,14 @@ EAGLE-3 Paper Benchmark.
 Exact 5 datasets from EAGLE-3 paper:
 1. MT-bench (80) - multi-turn conversation
 2. HumanEval (164) - code generation
-3. GSM8K (1319) - math reasoning
-4. Alpaca (805) - instruction following
+3. GSM8K (500) - math reasoning
+4. Alpaca (500) - instruction following
 5. CNN/Daily Mail (500) - summarization
 
-Reports: Speedup ratio, τ (acceptance length), Mean
+Methodology:
+- temp=0 (deterministic)
+- No max_new_tokens cap (natural EOS)
+- ShareGPT for profiling warmup
 
 Usage:
     python tile_spec/eagle_bench.py --configs AR Eagle3 Eagle3+TileSpec
@@ -28,14 +31,12 @@ from typing import Dict, List, Optional
 
 import torch
 
-# Dataset URLs
-URLS = {
-    "mtbench": "https://raw.githubusercontent.com/lm-sys/FastChat/main/fastchat/llm_judge/data/mt_bench/question.jsonl",
-    "humaneval": "https://github.com/openai/human-eval/raw/master/data/HumanEval.jsonl.gz",
-    "gsm8k": "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl",
-    "alpaca": "https://raw.githubusercontent.com/tatsu-lab/stanford_alpaca/main/alpaca_data.json",
-    "cnn_dm": "https://huggingface.co/datasets/abisee/cnn_dailymail/resolve/main/cnn_stories.tgz",
-}
+# URLs
+SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+MTBENCH_URL = "https://raw.githubusercontent.com/lm-sys/FastChat/main/fastchat/llm_judge/data/mt_bench/question.jsonl"
+HUMANEVAL_URL = "https://github.com/openai/human-eval/raw/master/data/HumanEval.jsonl.gz"
+GSM8K_URL = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+ALPACA_URL = "https://raw.githubusercontent.com/tatsu-lab/stanford_alpaca/main/alpaca_data.json"
 
 
 @dataclass
@@ -57,78 +58,83 @@ class Result:
     speedup: float = 1.0
 
 
-def download_file(url: str, path: Path) -> Path:
+def download(url: str, path: Path) -> Path:
     """Download file if not cached."""
     if path.exists():
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"  Downloading {path.name}...")
+    print(f"    Downloading {path.name}...")
     urllib.request.urlretrieve(url, path)
     return path
 
 
+def load_sharegpt(cache_dir: Path, limit: int = 200) -> List[str]:
+    """Load ShareGPT prompts for profiling."""
+    path = download(SHAREGPT_URL, cache_dir / "sharegpt.json")
+    with open(path) as f:
+        data = json.load(f)
+    prompts = []
+    for item in data:
+        if "conversations" in item:
+            for conv in item["conversations"]:
+                if conv.get("from") == "human" and conv.get("value"):
+                    text = conv["value"].strip()
+                    if 50 < len(text) < 2000:
+                        prompts.append(text)
+                        if len(prompts) >= limit:
+                            return prompts
+    return prompts
+
+
 def load_mtbench(cache_dir: Path, limit: int = 80) -> List[dict]:
-    """Load MT-bench: multi-turn conversation."""
-    path = download_file(URLS["mtbench"], cache_dir / "mtbench.jsonl")
+    """MT-bench: multi-turn conversation."""
+    path = download(MTBENCH_URL, cache_dir / "mtbench.jsonl")
     samples = []
     with open(path) as f:
         for line in f:
             obj = json.loads(line)
-            # Format: {"turns": ["q1", "q2"], ...}
-            samples.append({
-                "prompt": obj["turns"][0],
-                "multi_turn": obj["turns"] if len(obj["turns"]) > 1 else None,
-            })
+            samples.append({"turns": obj["turns"]})
             if len(samples) >= limit:
                 break
     return samples
 
 
 def load_humaneval(cache_dir: Path, limit: int = 164) -> List[dict]:
-    """Load HumanEval: code generation."""
-    gz_path = download_file(URLS["humaneval"], cache_dir / "HumanEval.jsonl.gz")
+    """HumanEval: code generation."""
+    path = download(HUMANEVAL_URL, cache_dir / "HumanEval.jsonl.gz")
     samples = []
-    with gzip.open(gz_path, 'rt') as f:
+    with gzip.open(path, 'rt') as f:
         for line in f:
             obj = json.loads(line)
-            # Format: {"prompt": "def func(...):\n    \"\"\"docstring\"\"\"\n", ...}
-            samples.append({
-                "prompt": f"Complete the following Python function:\n\n{obj['prompt']}",
-            })
+            samples.append({"prompt": f"Complete the following Python function:\n\n{obj['prompt']}"})
             if len(samples) >= limit:
                 break
     return samples
 
 
 def load_gsm8k(cache_dir: Path, limit: int = 500) -> List[dict]:
-    """Load GSM8K: math reasoning."""
-    path = download_file(URLS["gsm8k"], cache_dir / "gsm8k_test.jsonl")
+    """GSM8K: math reasoning."""
+    path = download(GSM8K_URL, cache_dir / "gsm8k.jsonl")
     samples = []
     with open(path) as f:
         for line in f:
             obj = json.loads(line)
-            samples.append({
-                "prompt": f"Question: {obj['question']}\nAnswer: Let's solve this step by step.",
-            })
+            samples.append({"prompt": f"Question: {obj['question']}\nAnswer: Let's solve step by step."})
             if len(samples) >= limit:
                 break
     return samples
 
 
 def load_alpaca(cache_dir: Path, limit: int = 500) -> List[dict]:
-    """Load Alpaca: instruction following."""
-    path = download_file(URLS["alpaca"], cache_dir / "alpaca_data.json")
+    """Alpaca: instruction following."""
+    path = download(ALPACA_URL, cache_dir / "alpaca.json")
     with open(path) as f:
         data = json.load(f)
-
     samples = []
     for item in data:
         instruction = item["instruction"]
-        input_text = item.get("input", "")
-        if input_text:
-            prompt = f"{instruction}\n\nInput: {input_text}"
-        else:
-            prompt = instruction
+        inp = item.get("input", "")
+        prompt = f"{instruction}\n\nInput: {inp}" if inp else instruction
         samples.append({"prompt": prompt})
         if len(samples) >= limit:
             break
@@ -136,25 +142,23 @@ def load_alpaca(cache_dir: Path, limit: int = 500) -> List[dict]:
 
 
 def load_cnn_dm(cache_dir: Path, limit: int = 500) -> List[dict]:
-    """Load CNN/Daily Mail: summarization (using HuggingFace)."""
+    """CNN/Daily Mail: summarization."""
     try:
         from datasets import load_dataset
         ds = load_dataset("cnn_dailymail", "3.0.0", split="test")
         samples = []
         for item in ds:
-            article = item["article"][:2000]  # Truncate long articles
-            samples.append({
-                "prompt": f"Summarize the following article:\n\n{article}\n\nSummary:",
-            })
+            article = item["article"][:2000]
+            samples.append({"prompt": f"Summarize:\n\n{article}\n\nSummary:"})
             if len(samples) >= limit:
                 break
         return samples
     except ImportError:
-        print("  Warning: 'datasets' not installed. Using synthetic summarization prompts.")
-        return [{"prompt": f"Summarize: Article {i} about news events."} for i in range(limit)]
+        print("    Warning: 'datasets' not installed, using synthetic prompts")
+        return [{"prompt": f"Summarize this news article about topic {i}."} for i in range(limit)]
 
 
-LOADERS = {
+DATASETS = {
     "mt_bench": (load_mtbench, 80),
     "humaneval": (load_humaneval, 164),
     "gsm8k": (load_gsm8k, 500),
@@ -163,124 +167,82 @@ LOADERS = {
 }
 
 
-def run_dataset(
-    engine,
-    samples: List[dict],
-    dataset_name: str,
-    max_new_tokens: int = 512,
-) -> Result:
-    """Run benchmark on a dataset."""
+def run_dataset(engine, samples: List[dict], name: str) -> Result:
+    """Run benchmark on dataset. No max_new_tokens - natural EOS."""
     total_tokens = 0
     total_time = 0.0
     accept_lengths = []
 
     for sample in samples:
-        prompt = sample["prompt"]
-        multi_turn = sample.get("multi_turn")
-
-        if multi_turn:
-            # Multi-turn conversation (MT-bench style)
-            conversation = []
-            for i, turn in enumerate(multi_turn):
-                conversation.append({"role": "user", "content": turn})
-
+        if "turns" in sample:
+            # Multi-turn (MT-bench)
+            conv = []
+            for turn in sample["turns"]:
+                conv.append({"role": "user", "content": turn})
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                result = engine.generate(conversation, sampling_params={"temperature": 0, "max_new_tokens": max_new_tokens})
+                result = engine.generate(conv, sampling_params={"temperature": 0})
                 torch.cuda.synchronize()
-                elapsed = time.perf_counter() - t0
+                total_time += time.perf_counter() - t0
 
                 meta = result.get("meta_info", {})
-                tokens = meta.get("completion_tokens", len(result.get("text", "").split()))
-                accept_len = meta.get("spec_accept_length", 0)
-
-                total_tokens += tokens
-                total_time += elapsed
-                if accept_len > 0:
-                    accept_lengths.append(accept_len)
-
-                conversation.append({"role": "assistant", "content": result.get("text", "")})
+                total_tokens += meta.get("completion_tokens", len(result.get("text", "").split()))
+                if meta.get("spec_accept_length", 0) > 0:
+                    accept_lengths.append(meta["spec_accept_length"])
+                conv.append({"role": "assistant", "content": result.get("text", "")})
         else:
-            # Single-turn
+            # Single turn
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            result = engine.generate(prompt, sampling_params={"temperature": 0, "max_new_tokens": max_new_tokens})
+            result = engine.generate(sample["prompt"], sampling_params={"temperature": 0})
             torch.cuda.synchronize()
-            elapsed = time.perf_counter() - t0
+            total_time += time.perf_counter() - t0
 
             meta = result.get("meta_info", {})
-            tokens = meta.get("completion_tokens", len(result.get("text", "").split()))
-            accept_len = meta.get("spec_accept_length", 0)
-
-            total_tokens += tokens
-            total_time += elapsed
-            if accept_len > 0:
-                accept_lengths.append(accept_len)
-
-    throughput = total_tokens / total_time if total_time > 0 else 0
-    mean_accept = sum(accept_lengths) / len(accept_lengths) if accept_lengths else 1.0
+            total_tokens += meta.get("completion_tokens", len(result.get("text", "").split()))
+            if meta.get("spec_accept_length", 0) > 0:
+                accept_lengths.append(meta["spec_accept_length"])
 
     return Result(
-        dataset=dataset_name,
+        dataset=name,
         num_samples=len(samples),
         total_tokens=total_tokens,
         total_time=total_time,
-        throughput=throughput,
-        accept_length=mean_accept,
+        throughput=total_tokens / total_time if total_time > 0 else 0,
+        accept_length=sum(accept_lengths) / len(accept_lengths) if accept_lengths else 1.0,
     )
 
 
-def run_config(
-    config: Config,
-    datasets: Dict[str, List[dict]],
-    model_path: str,
-    draft_path: str,
-    batch_size: int,
-) -> Dict[str, Result]:
+def run_config(config: Config, datasets: Dict, model: str, draft: str, cache_dir: Path) -> Dict[str, Result]:
     """Run all datasets for a config."""
     import sglang as sgl
 
-    kwargs = {
-        "model_path": model_path,
-        "dtype": "float16",
-        "max_running_requests": batch_size,
-    }
-
+    kwargs = {"model_path": model, "dtype": "float16"}
     if config.speculative_algorithm:
         kwargs.update({
             "speculative_algorithm": config.speculative_algorithm,
-            "speculative_draft_model_path": config.draft_model_path or draft_path,
+            "speculative_draft_model_path": config.draft_model_path or draft,
             "speculative_num_steps": 5,
             "speculative_eagle_topk": 8,
             "speculative_num_draft_tokens": 64,
         })
-
     if config.tile_spec:
         kwargs["tile_spec"] = True
 
-    print(f"\n{'='*70}")
-    print(f"Config: {config.name}")
-    print(f"{'='*70}")
-
+    print(f"\n{'='*70}\nConfig: {config.name}\n{'='*70}")
     engine = sgl.Engine(**kwargs)
 
-    # Warmup
-    print("Warmup...")
-    for _ in range(3):
-        engine.generate("Hello, how are you?", sampling_params={"temperature": 0, "max_new_tokens": 32})
+    # Warmup with ShareGPT (also does profiling for tile-spec)
+    sharegpt = load_sharegpt(cache_dir, limit=150 if config.tile_spec else 10)
+    print(f"Warmup with {len(sharegpt)} ShareGPT prompts...")
+    for prompt in sharegpt:
+        engine.generate(prompt, sampling_params={"temperature": 0})
 
-    if config.tile_spec:
-        print("Tile-spec profiling...")
-        for _ in range(100):
-            engine.generate("Explain machine learning briefly.", sampling_params={"temperature": 0, "max_new_tokens": 64})
-
-    # Run each dataset
+    # Run datasets
     results = {}
     for name, samples in datasets.items():
         print(f"\n  [{name}] {len(samples)} samples...")
-        # Different max_new_tokens per task
-        max_tokens = 512 if name != "humaneval" else 256
-        result = run_dataset(engine, samples, name, max_new_tokens=max_tokens)
+        result = run_dataset(engine, samples, name)
         results[name] = result
         print(f"    {result.throughput:.1f} tok/s, τ={result.accept_length:.2f}")
 
@@ -288,33 +250,29 @@ def run_config(
     del engine
     gc.collect()
     torch.cuda.empty_cache()
-
     return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="EAGLE-3 Paper Benchmark")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--draft", default="lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B")
     parser.add_argument("--cache-dir", default="tile_spec/data")
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--output", default="tile_spec/eagle_bench_results.json")
+    parser.add_argument("--output", default="tile_spec/results.json")
     parser.add_argument("--configs", nargs="+", default=["AR", "Eagle3", "Eagle3+TileSpec"])
     parser.add_argument("--datasets", nargs="+", default=["mt_bench", "humaneval", "gsm8k", "alpaca", "cnn_dm"])
     args = parser.parse_args()
 
     cache_dir = Path(args.cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Load datasets
     print("Loading datasets...")
     datasets = {}
     for name in args.datasets:
-        if name in LOADERS:
-            loader, default_limit = LOADERS[name]
-            print(f"  Loading {name}...")
-            datasets[name] = loader(cache_dir, default_limit)
-            print(f"    Loaded {len(datasets[name])} samples")
+        if name in DATASETS:
+            loader, limit = DATASETS[name]
+            datasets[name] = loader(cache_dir, limit)
+            print(f"  {name}: {len(datasets[name])} samples")
 
     # Configs
     all_configs = {
@@ -323,66 +281,52 @@ def main():
         "Eagle3+TileSpec": Config("Eagle3+TileSpec", "EAGLE3", args.draft, tile_spec=True),
     }
 
-    # Run benchmarks
+    # Run
     all_results = {}
     ar_results = None
-
     for name in args.configs:
-        config = all_configs[name]
-        results = run_config(config, datasets, args.model, args.draft, args.batch_size)
+        results = run_config(all_configs[name], datasets, args.model, args.draft, cache_dir)
         all_results[name] = results
-
         if name == "AR":
             ar_results = results
         elif ar_results:
-            for ds, result in results.items():
+            for ds, r in results.items():
                 if ds in ar_results:
-                    ar_tp = ar_results[ds].throughput
-                    result.speedup = result.throughput / ar_tp if ar_tp > 0 else 1.0
+                    r.speedup = r.throughput / ar_results[ds].throughput if ar_results[ds].throughput > 0 else 1.0
 
     # Print summary
     print(f"\n{'='*90}")
-    print(f"{'Dataset':<12} ", end="")
+    print(f"{'Dataset':<12} | ", end="")
     for name in args.configs:
-        print(f"| {name:<24} ", end="")
+        print(f"{name:<24} | ", end="")
     print()
     print("-" * 90)
-
     for ds in args.datasets:
-        print(f"{ds:<12} ", end="")
+        print(f"{ds:<12} | ", end="")
         for name in args.configs:
-            if ds in all_results.get(name, {}):
-                r = all_results[name][ds]
-                print(f"| {r.speedup:>5.2f}x  τ={r.accept_length:<6.2f} ", end="")
+            r = all_results[name].get(ds)
+            if r:
+                print(f"{r.speedup:>5.2f}x  τ={r.accept_length:<6.2f} | ", end="")
             else:
-                print(f"| {'N/A':<24} ", end="")
+                print(f"{'N/A':<24} | ", end="")
         print()
-
-    # Mean
     print("-" * 90)
-    print(f"{'Mean':<12} ", end="")
+    print(f"{'Mean':<12} | ", end="")
     for name in args.configs:
-        speedups = [all_results[name][ds].speedup for ds in args.datasets if ds in all_results.get(name, {})]
-        accepts = [all_results[name][ds].accept_length for ds in args.datasets if ds in all_results.get(name, {})]
+        speedups = [all_results[name][ds].speedup for ds in args.datasets if ds in all_results[name]]
+        accepts = [all_results[name][ds].accept_length for ds in args.datasets if ds in all_results[name]]
         if speedups:
-            print(f"| {sum(speedups)/len(speedups):>5.2f}x  τ={sum(accepts)/len(accepts):<6.2f} ", end="")
-        else:
-            print(f"| {'N/A':<24} ", end="")
+            print(f"{sum(speedups)/len(speedups):>5.2f}x  τ={sum(accepts)/len(accepts):<6.2f} | ", end="")
     print()
 
-    # Save results
+    # Save
     Path(args.output).parent.mkdir(exist_ok=True)
     with open(args.output, "w") as f:
         json.dump({
-            "model": args.model,
-            "draft": args.draft,
-            "results": {
-                name: {ds: {"speedup": r.speedup, "accept_length": r.accept_length, "throughput": r.throughput}
-                       for ds, r in results.items()}
-                for name, results in all_results.items()
-            }
+            "model": args.model, "draft": args.draft,
+            "results": {n: {d: {"speedup": r.speedup, "accept_length": r.accept_length, "throughput": r.throughput}
+                            for d, r in res.items()} for n, res in all_results.items()}
         }, f, indent=2)
-
     print(f"\nSaved to {args.output}")
 
 
