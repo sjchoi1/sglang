@@ -2,6 +2,8 @@
 
 This document captures key insights about the SGLang codebase, particularly speculative decoding.
 
+**Base commit:** `0071fe9c407ad59f2803cc319e1bcaa3ac2021f1`
+
 ## Build & Test Commands
 
 ```bash
@@ -31,14 +33,17 @@ sglang/
 │   │   ├── standalone_worker.py # Draft LM-based speculative worker
 │   │   ├── ngram_worker.py     # NGRAM speculative worker
 │   │   ├── eagle_utils.py      # Tree building, verification kernels
-│   │   ├── tile_aware.py       # Tile-aware dynamic speculation
-│   │   └── profile_tile_aware.py # Profiling script
+│   │   └── tile_spec/          # TileSpec: tile-aware dynamic speculation
+│   │       ├── core.py         # Calibration, latency model, compute_optimal_k
+│   │       └── profiler.py     # Automatic profiling and caching
 │   ├── managers/
 │   │   └── schedule_batch.py   # Batch management, ScheduleBatch class
 │   ├── layers/sampler.py       # Sampling logic
 │   └── server_args.py          # CLI argument definitions
 ├── sgl-kernel/                 # CUDA kernels
 │   └── csrc/speculative/       # Speculative sampling CUDA code
+├── tile_spec/                  # TileSpec benchmarks and tests
+│   └── run_bench.py            # Benchmark script
 └── test/                       # Test files
 ```
 
@@ -84,125 +89,60 @@ batch.input_ids = self.draft_token  # Shape: [bs * num_draft_tokens]
 
 This means the total token count affects GPU tile efficiency (MLP tiling).
 
-## Tile-Aware Dynamic Speculation
+## TileSpec: Tile-Aware Dynamic Speculation
 
-### Motivation
+### Purpose
 
-GPU MLPs have tile boundaries (e.g., 64, 128, 256 tokens) where latency jumps. Fixed draft token counts may land inefficiently between tiles. The tile-aware algorithm dynamically selects the optimal number of draft tokens to maximize:
+GPU MLPs have tile boundaries (e.g., 64, 128, 256 tokens) where latency jumps discontinuously. TileSpec dynamically selects the optimal draft token count to maximize throughput:
 
 ```
-E[accepted_tokens + bonus_tokens] / Latency(prefill + draft_tokens)
+Objective: maximize E[accepted_tokens] / Latency(total_tokens)
 ```
 
-### Supported Algorithms
+### High-Level Flow
 
-Tile-aware optimization works with all three speculative decoding algorithms:
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. PROFILING (automatic on first run)                              │
+│     - Engine runs warmup requests with varying batch sizes          │
+│     - Records (token_count, latency) pairs during verify() calls    │
+│     - Collects (score, accepted) pairs for calibration              │
+│     - Fits latency model + calibration, caches to disk              │
+├─────────────────────────────────────────────────────────────────────┤
+│  2. RUNTIME (after profiling or cache load)                         │
+│     - draft_forward(): generate draft tokens with confidence scores │
+│     - compute_optimal_k(): find best k at tile boundaries           │
+│       • Calibrate scores → acceptance probabilities                 │
+│       • Search only at segment endpoints (64, 128, 192, 256...)     │
+│       • Select k with best E[accepted]/Latency ratio                │
+│     - verify(): run target model, record data if still profiling    │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-| Algorithm | Worker | Tile-Aware Approach |
-|-----------|--------|---------------------|
-| **EAGLE/EAGLE3** | `eagle_worker.py` | Dynamic per-batch k selection using calibrated scores |
-| **STANDALONE** (Draft LM) | `standalone_worker.py` | Same as EAGLE (inherits from EAGLEWorker) |
-| **NGRAM** | `ngram_worker.py` | TODO: expose norm_freq from C++ for dynamic selection |
+### Key Components
 
-### Algorithm Overview
-
-1. **Calibration** (EAGLE/STANDALONE only): Map cumulative draft confidence scores to acceptance probabilities
-   - Histogram binning (50 bins by default)
-   - Fitted offline from (score, accepted) pairs
-
-2. **Latency Model** (all algorithms): Piecewise linear with automatic boundary detection
-   - Detects tile boundaries via 15% latency jumps (e.g., at 65, 129, 193, 257, 385 on A100)
-   - Stores exact boundary latencies for fast lookup
-   - Fits linear regression per segment for interpolation
-
-3. **Optimal k Selection**:
-   - **Key insight**: Search at segment END points (64, 128, 192, 256...), NOT start points
-   - This maximizes tokens before each latency jump
-   - **EAGLE/STANDALONE**: Per-batch dynamic selection
-     - Calibrate draft scores → acceptance probabilities
-     - Sort globally by probability (descending)
-     - Compute cumulative expected accepted tokens
-     - Search only optimal k candidates (O(5) not O(N)) to find best E/L ratio
-   - **NGRAM**: Static adjustment at init
-     - Snap `draft_token_num` to nearest optimal k value
-
-### A100 Tile Boundaries (Llama-8B MLP dimensions)
-
-Detected boundaries with 15% jump threshold:
-- Segment [1, 65): optimal k = 64
-- Segment [65, 129): optimal k = 128
-- Segment [129, 193): optimal k = 192
-- Segment [193, 257): optimal k = 256
-- Segment [257, 385): optimal k = 384
-- Segment [385, 513): optimal k = 512
-
-### Calibration Dataset Considerations
-
-**Does the calibration dataset matter?** Yes, but moderately:
-
-1. **What affects calibration**:
-   - The draft-target model pair (same pair = same calibration)
-   - Domain distribution (code vs chat vs reasoning)
-   - Prompt length distribution
-
-2. **Practical recommendations**:
-   - Use a diverse dataset (mix of domains) for robustness
-   - Or calibrate per-domain if workloads are distinct
-   - The latency model is domain-agnostic (GPU hardware dependent)
-
-3. **When to recalibrate**:
-   - Changing draft or target model
-   - Significant shift in workload distribution
-
-### Files
-
-- `python/sglang/srt/speculative/tile_aware.py`: Core algorithm
-  - `Calibration`: Score → probability mapping (EAGLE/STANDALONE)
-  - `PiecewiseLinearLatency`: Boundary detection + linear regression
-  - `get_optimal_k_candidates()`: Returns segment END points for searching
-  - `compute_optimal_k()`: Finds optimal draft token count
-
-- `tilespec/`: Testing and profiling directory
-  - `test_01_latency_profiler.py`: Profile MLP latency, detect tile boundaries
-  - `test_02_piecewise_fit.py`: Verify latency model fit accuracy
-  - `test_03_collect_calibration.py`: Collect (score, accepted) calibration data
-  - `test_04_fit_calibration.py`: Fit calibration model from data
-  - `test_05_compute_optimal_k.py`: Test optimal k selection algorithm
-  - `test_06_benchmark.py`: Simulated throughput comparison
-  - `latency_model.npz`: Fitted latency model for A100
-  - `calibration.npz`: Fitted calibration model (simulated)
+| Component | File | Purpose |
+|-----------|------|---------|
+| `Calibration` | `tile_spec/core.py` | Maps draft scores → acceptance probability (histogram binning) |
+| `PiecewiseLinearLatency` | `tile_spec/core.py` | Models latency with tile boundary detection (15% jump threshold) |
+| `compute_optimal_k()` | `tile_spec/core.py` | Finds optimal k by searching segment endpoints |
+| `TileSpecProfiler` | `tile_spec/profiler.py` | Automatic profiling during warmup, caching |
 
 ### Configuration
 
 ```bash
---speculative-tile-aware              # Enable feature
---speculative-calibration-path PATH   # Path to calibration.npz (EAGLE/STANDALONE)
---speculative-latency-path PATH       # Path to latency_model.npz (all algorithms)
+--tile-spec    # Enable TileSpec optimization (EAGLE/STANDALONE only)
 ```
 
-### Integration Points
+Cache stored in: `tile_spec/cache/{model}_{gpu}_tp{N}/`
 
-**EAGLE/STANDALONE** (`eagle_worker.py`, `standalone_worker.py`):
-```python
-# In draft_forward(), after generating draft scores:
-if self.enable_tile_aware:
-    num_draft_tokens = compute_optimal_k(
-        scores_cat,
-        self.calibration,
-        self.latency_model,
-        prefill_tokens=0,
-        max_k=self.speculative_num_draft_tokens,
-    )
-```
+### Supported Algorithms
 
-**NGRAM** (`ngram_worker.py`):
-```python
-# TODO: NGRAM has internal norm_freq scores in C++ (ngram.cpp matchProb)
-# but they're not exposed to Python. To enable dynamic tile-aware:
-# 1. Modify Result struct to include std::vector<float> scores
-# 2. Return norm_freq alongside tokens
-# 3. Use calibration like EAGLE
-```
+| Algorithm | Support | Notes |
+|-----------|---------|-------|
+| EAGLE/EAGLE3 | ✓ Full | Dynamic per-batch k selection |
+| STANDALONE | ✓ Full | Inherits from EAGLEWorker |
+| NGRAM | ✗ | Would require C++ changes to expose scores |
 
 ## CUDA Kernels
 

@@ -805,6 +805,11 @@ class EAGLEWorker(TpModelWorker):
 
             self.tile_spec_profiler.record(num_tokens, latency_ms, scores, accepted)
 
+            # Update worker models after profiling completes
+            if self.latency_model is None and self.tile_spec_profiler.latency_model is not None:
+                self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
+                logger.info(f"TileSpec: Profiling complete, boundaries={self.latency_model.boundaries}")
+
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
