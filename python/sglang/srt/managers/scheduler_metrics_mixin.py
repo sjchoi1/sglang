@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional
@@ -21,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
+
+def _is_tile_spec_profiling() -> bool:
+    """Check if TileSpec profiling is active (suppress batch logs)."""
+    return os.environ.get("SGLANG_TILE_SPEC_PROFILING") == "1"
 
 
 class KvMetrics:
@@ -168,7 +173,8 @@ class SchedulerMetricsMixin:
             f += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
             f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
 
-        logger.info(f)
+        if not _is_tile_spec_profiling():
+            logger.info(f)
 
         if self.enable_metrics:
             # Basics
@@ -323,7 +329,9 @@ class SchedulerMetricsMixin:
             f"#queue-req: {len(self.waiting_queue)}, "
         )
 
-        logger.info(msg)
+        if not _is_tile_spec_profiling():
+            logger.info(msg)
+
         if self.enable_metrics:
             # Basics
             self.stats.num_running_reqs = num_running_reqs
