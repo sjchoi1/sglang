@@ -584,15 +584,22 @@ class EAGLEWorker(TpModelWorker):
 
         if is_per_request_mode:
             # Build per-request trees and concatenate
+            # NOTE: We pad metadata tensors (retrive_*) to max_k for batching,
+            # but draft_tokens remain exact (no padding) for efficiency
+            bs = len(per_request_draft_tokens)
+            max_k = int(per_request_draft_tokens.max().item())
+            device = batch.seq_lens.device
+
             all_tree_masks = []
             all_positions = []
-            all_retrive_indices = []
-            all_retrive_next_tokens = []
-            all_retrive_next_siblings = []
             all_draft_tokens = []
 
+            # Preallocate padded metadata tensors
+            retrive_index = torch.full((bs, max_k), -1, dtype=torch.long, device=device)
+            retrive_next_token = torch.full((bs, max_k), -1, dtype=torch.long, device=device)
+            retrive_next_sibling = torch.full((bs, max_k), -1, dtype=torch.long, device=device)
+
             total_tokens = 0
-            per_request_offsets = [0]
 
             for i in range(bs):
                 k_i = int(per_request_draft_tokens[i].item())
@@ -601,7 +608,7 @@ class EAGLEWorker(TpModelWorker):
                 if len(parent_list.shape) == 2:
                     parent_list_i = parent_list[i:i+1]
                 else:
-                    parent_list_i = torch.empty(1, 0, device=parent_list.device)
+                    parent_list_i = torch.empty(1, 0, device=device)
 
                 # Build tree for this request with exact k_i tokens
                 (
@@ -623,26 +630,28 @@ class EAGLEWorker(TpModelWorker):
                     k_i,
                 )
 
+                # Collect tree masks and positions (variable size per request)
                 all_tree_masks.append(tree_mask_i)
                 all_positions.append(position_i)
-                all_retrive_indices.append(retrive_index_i)
-                all_retrive_next_tokens.append(retrive_next_token_i)
-                all_retrive_next_siblings.append(retrive_next_sibling_i)
+
+                # Fill padded metadata tensors (retrive_* need uniform shape)
+                retrive_index[i, :k_i] = retrive_index_i[0, :k_i]
+                retrive_next_token[i, :k_i] = retrive_next_token_i[0, :k_i]
+                retrive_next_sibling[i, :k_i] = retrive_next_sibling_i[0, :k_i]
+
+                # Draft tokens: exact count, NO PADDING
                 all_draft_tokens.append(draft_tokens_i)
 
                 total_tokens += k_i
-                per_request_offsets.append(total_tokens)
 
-            # Concatenate all outputs globally
+            # Concatenate variable-size outputs
             tree_mask = torch.cat(all_tree_masks, dim=0)
             position = torch.cat(all_positions, dim=0)
-            retrive_index = torch.cat(all_retrive_indices, dim=0)
-            retrive_next_token = torch.cat(all_retrive_next_tokens, dim=0)
-            retrive_next_sibling = torch.cat(all_retrive_next_siblings, dim=0)
             draft_tokens = torch.cat(all_draft_tokens, dim=0)
 
-            # Store offsets for verification
-            draft_token_num = total_tokens
+            # draft_token_num is max_k for compatibility with metadata tensors
+            # actual per-request counts stored in per_request_draft_token_num
+            draft_token_num = max_k
         else:
             # Uniform mode: original single call
             (
