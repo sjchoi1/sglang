@@ -16,10 +16,12 @@ cd /home/user/sglang/tile_spec
 - **Token counts explored**: Comprehensive coverage from 8 to ~1024 tokens
 - **Duration**: ~5-10 minutes
 - **Min samples**: 70 with at least 6 unique token counts
+- **Progress display**: tqdm progress bar (install with `pip install tqdm`)
 
 ### 2. Collected Data
 - **Latency data**: (num_tokens, latency_ms) pairs
 - **Calibration data**: (cumulative_score, accepted) pairs
+- **Automatic log suppression**: HTTP and batch logs are suppressed during profiling for cleaner output
 
 ### 3. Model Fitting
 - **Latency model**: Piecewise linear with automatic tile boundary detection

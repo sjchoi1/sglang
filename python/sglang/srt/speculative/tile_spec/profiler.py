@@ -21,11 +21,43 @@ from sglang.srt.speculative.tile_spec.core import Calibration, PiecewiseLinearLa
 
 logger = logging.getLogger(__name__)
 
+# Try to import tqdm, fallback to no-op if not available
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
+
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 # Comprehensive batch size sweep for profiling - covers full range 1-128
 # With K values 1-8, this explores all token counts from 1 to ~1024
 WARMUP_BATCH_SIZES = list(range(1, 129))
+
+# Store original log levels for restoration
+_original_log_levels = {}
+
+def _suppress_profiling_logs():
+    """Temporarily suppress verbose logs during profiling."""
+    global _original_log_levels
+    # Suppress scheduler metrics logs (Decode/Prefill batch messages)
+    metrics_logger = logging.getLogger("sglang.srt.managers.scheduler_metrics_mixin")
+    _original_log_levels["metrics"] = metrics_logger.level
+    metrics_logger.setLevel(logging.WARNING)
+
+    # Suppress uvicorn access logs (HTTP 200 OK messages)
+    uvicorn_logger = logging.getLogger("uvicorn.access")
+    _original_log_levels["uvicorn"] = uvicorn_logger.level
+    uvicorn_logger.setLevel(logging.WARNING)
+
+def _restore_profiling_logs():
+    """Restore original logging levels after profiling."""
+    global _original_log_levels
+    if "metrics" in _original_log_levels:
+        logging.getLogger("sglang.srt.managers.scheduler_metrics_mixin").setLevel(_original_log_levels["metrics"])
+    if "uvicorn" in _original_log_levels:
+        logging.getLogger("uvicorn.access").setLevel(_original_log_levels["uvicorn"])
+    _original_log_levels.clear()
 
 # Cache location: Find project root to avoid path nesting issues
 def _get_tile_spec_cache_root() -> Path:
@@ -117,39 +149,49 @@ def tile_spec_warmup(
     draft_values = list(range(1, 9)) if set_draft_fn is not None else [None]
     if len(draft_values) > 1:
         logger.info(f"  Draft tokens: {draft_values} (comprehensive draft sweep)")
-    logger.info(f"  Total configurations: {len(WARMUP_BATCH_SIZES)} batch sizes × {len(draft_values)} draft values")
+    total_configs = len(WARMUP_BATCH_SIZES) * len(draft_values)
+    logger.info(f"  Total configurations: {total_configs}")
 
     # Load prompts from shared cache
     prompts = _load_prompts(limit=200)
 
-    # Run warmup with varying batch sizes and draft token counts
-    idx = 0
-    total_runs = 0
+    # Suppress verbose logs during profiling
+    _suppress_profiling_logs()
 
-    for draft_value in draft_values:
-        # Set draft token count if callback provided
-        if set_draft_fn is not None and draft_value is not None:
-            try:
-                set_draft_fn(draft_value)
-                logger.info(f"TileSpec: Set draft={draft_value}")
-            except Exception as e:
-                logger.warning(f"TileSpec: Failed to set draft={draft_value}: {e}")
-                continue
+    try:
+        # Run warmup with varying batch sizes and draft token counts
+        idx = 0
+        total_runs = 0
 
-        for batch_size in WARMUP_BATCH_SIZES:
-            batch = prompts[idx:idx + batch_size]
-            idx = (idx + batch_size) % len(prompts)  # Wrap around if needed
-            if not batch:
-                break
-            try:
-                generate_fn(batch)
-                total_runs += 1
-                # Log periodically (every 64 runs or at draft transitions)
-                if total_runs % 64 == 0 or (batch_size == WARMUP_BATCH_SIZES[0] and draft_value is not None):
-                    draft_info = f" draft={draft_value}" if draft_value is not None else ""
-                    logger.info(f"TileSpec: Warmup bs={batch_size}{draft_info} done (total: {total_runs})")
-            except Exception as e:
-                logger.warning(f"TileSpec: Warmup batch failed: {e}")
+        pbar = tqdm(total=total_configs, desc="TileSpec Profiling", unit="run", ncols=80)
+
+        for draft_value in draft_values:
+            # Set draft token count if callback provided
+            if set_draft_fn is not None and draft_value is not None:
+                try:
+                    set_draft_fn(draft_value)
+                    pbar.set_postfix({"draft": draft_value})
+                except Exception as e:
+                    logger.warning(f"TileSpec: Failed to set draft={draft_value}: {e}")
+                    continue
+
+            for batch_size in WARMUP_BATCH_SIZES:
+                batch = prompts[idx:idx + batch_size]
+                idx = (idx + batch_size) % len(prompts)  # Wrap around if needed
+                if not batch:
+                    break
+                try:
+                    generate_fn(batch)
+                    total_runs += 1
+                    pbar.update(1)
+                except Exception as e:
+                    logger.warning(f"TileSpec: Warmup batch failed: {e}")
+                    pbar.update(1)
+
+        pbar.close()
+    finally:
+        # Restore logging levels even if profiling fails
+        _restore_profiling_logs()
 
     logger.info(f"TileSpec: Completed {total_runs} warmup runs")
 
