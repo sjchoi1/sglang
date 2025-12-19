@@ -292,13 +292,6 @@ class TileSpecProfiler:
             for s, a in zip(scores_np, accepted_np):
                 self._calibration_data.append((float(s), bool(a)))
 
-        # Auto-finish when enough diverse samples
-        if len(self._latency_data) >= self.min_samples:
-            unique = len(set(t for t, _ in self._latency_data))
-            if unique >= self.min_unique_counts:
-                logger.info(f"TileSpec: Auto-finishing profiling ({len(self._latency_data)} samples, {unique} unique token counts)")
-                self.finish_profiling()
-
     def finish_profiling(self):
         """Fit latency model from collected data."""
         if not self._profiling:
@@ -309,15 +302,33 @@ class TileSpecProfiler:
             logger.warning(f"TileSpec: Only {len(self._latency_data)} samples")
             return
 
-        # Aggregate by token count
+        # Aggregate by token count with outlier removal
         by_tokens = defaultdict(list)
         for n, lat in self._latency_data:
             by_tokens[n].append(lat)
 
-        token_counts = sorted(by_tokens.keys())
-        latencies = [np.median(by_tokens[t]) for t in token_counts]
+        # Remove outliers using IQR method per token count
+        by_tokens_clean = {}
+        outliers = {}
+        for token_count, lats in by_tokens.items():
+            if len(lats) >= 3:
+                lats_arr = np.array(lats)
+                q1, q3 = np.percentile(lats_arr, [25, 75])
+                iqr = q3 - q1
+                lower_bound = q1 - 1.5 * iqr
+                upper_bound = q3 + 1.5 * iqr
+                mask = (lats_arr >= lower_bound) & (lats_arr <= upper_bound)
+                by_tokens_clean[token_count] = lats_arr[mask].tolist()
+                outliers[token_count] = lats_arr[~mask].tolist()
+            else:
+                by_tokens_clean[token_count] = lats
+                outliers[token_count] = []
 
-        logger.info(f"TileSpec: Fitting from {len(self._latency_data)} samples")
+        token_counts = sorted(by_tokens_clean.keys())
+        latencies = [np.median(by_tokens_clean[t]) for t in token_counts]
+
+        total_outliers = sum(len(o) for o in outliers.values())
+        logger.info(f"TileSpec: Fitting from {len(self._latency_data)} samples ({total_outliers} outliers removed)")
         logger.info(f"  Token counts: {token_counts}")
 
         self.latency_model = PiecewiseLinearLatency()
