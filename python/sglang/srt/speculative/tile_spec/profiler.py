@@ -138,10 +138,15 @@ def tile_spec_warmup(
     logger.info(f"TileSpec: Completed {total_runs} warmup runs")
 
     # Wait for profiling to complete (auto-finishes when enough samples)
-    for _ in range(max_wait):
-        if check_ready_fn():
-            logger.info("TileSpec: Profiling complete")
-            return
+    logger.info(f"TileSpec: Waiting for profiling to complete (max {max_wait}s)...")
+    for i in range(max_wait):
+        try:
+            is_ready = check_ready_fn()
+            if is_ready:
+                logger.info(f"TileSpec: Profiling complete (checked after {i+1}s)")
+                return
+        except Exception as e:
+            logger.warning(f"TileSpec: check_ready_fn() failed in loop: {e}")
         time.sleep(1.0)
 
     logger.warning("TileSpec: Profiling timeout, continuing anyway")
