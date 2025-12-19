@@ -3467,7 +3467,7 @@ class ServerArgs:
             "--tile-spec",
             action="store_true",
             default=ServerArgs.tile_spec,
-            help="Enable tile-spec optimization for speculative decoding. Auto-profiles latency and calibrates using ShareGPT on first run, caches results in tile_spec/cache/.",
+            help="Enable tile-spec optimization for speculative decoding. Auto-profiles latency and calibrates using ShareGPT on first run, caches results in ~/.cache/sglang/tile_spec/.",
         )
 
         # Expert parallelism

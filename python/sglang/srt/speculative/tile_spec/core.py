@@ -189,10 +189,6 @@ class PiecewiseLinearLatency:
 
         return latencies
 
-    def get_boundaries(self) -> List[int]:
-        """Return tile boundaries (segment start points)."""
-        return self.boundaries[:-1]
-
     def save(self, path: str):
         np.savez(
             path,

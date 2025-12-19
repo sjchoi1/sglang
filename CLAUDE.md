@@ -158,7 +158,7 @@ sorted_probs = torch.sort(probs.flatten(), descending=True)
 --tile-spec    # Enable TileSpec optimization (EAGLE/STANDALONE only)
 ```
 
-Cache stored in: `tile_spec/cache/{model}_{gpu}_tp{N}/`
+Cache stored in: `~/.cache/sglang/tile_spec/{model}_{gpu}_tp{N}/`
 
 ### Supported Algorithms
 

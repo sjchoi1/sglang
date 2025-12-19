@@ -2,7 +2,7 @@
 Tile-Spec Profiler - Automatic profiling during warmup.
 
 Profiles latency by recording actual verify() calls.
-Cache structure: tile_spec/cache/{model}_{gpu}_{tp}/
+Cache structure: ~/.cache/sglang/tile_spec/{model}_{gpu}_tp{N}/
 """
 
 import json
@@ -24,40 +24,24 @@ logger = logging.getLogger(__name__)
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 WARMUP_BATCH_SIZES = [1, 4, 16, 64]
 
+# Cache location: ~/.cache/sglang/tile_spec/
+TILE_SPEC_CACHE_ROOT = Path.home() / ".cache" / "sglang" / "tile_spec"
+
 
 def get_cache_dir(model_path: str, gpu_name: str, tp_size: int) -> Path:
-    """Get cache directory path."""
+    """Get cache directory path for model-specific profiling data."""
     model_name = re.sub(r"[^a-z0-9-]", "", model_path.split("/")[-1].lower())
     gpu_short = re.sub(r"[^a-z0-9]", "", gpu_name.lower().replace("nvidia ", ""))
     cache_name = f"{model_name}_{gpu_short}_tp{tp_size}"
-
-    # Try project root first
-    current = Path(__file__).parent
-    while current != current.parent:
-        if (current / "tile_spec").exists():
-            return current / "tile_spec" / "cache" / cache_name
-        current = current.parent
-    return Path.home() / ".cache" / "sglang" / "tile_spec" / cache_name
-
-
-def _get_shared_cache_dir() -> Path:
-    """Get shared cache directory for datasets (not model-specific)."""
-    # Try project root first
-    current = Path(__file__).parent
-    while current != current.parent:
-        if (current / "tile_spec").exists():
-            return current / "tile_spec" / "cache"
-        current = current.parent
-    return Path.home() / ".cache" / "sglang" / "tile_spec"
+    return TILE_SPEC_CACHE_ROOT / cache_name
 
 
 def _load_prompts(limit: int = 100) -> List[str]:
     """Load ShareGPT prompts for profiling warmup."""
-    shared_cache = _get_shared_cache_dir()
-    sharegpt_path = shared_cache / "sharegpt.json"
+    sharegpt_path = TILE_SPEC_CACHE_ROOT / "sharegpt.json"
 
     if not sharegpt_path.exists():
-        shared_cache.mkdir(parents=True, exist_ok=True)
+        TILE_SPEC_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
         try:
             logger.info("TileSpec: Downloading ShareGPT dataset...")
             urllib.request.urlretrieve(SHAREGPT_URL, sharegpt_path)
