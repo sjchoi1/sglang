@@ -109,9 +109,9 @@ class EAGLEWorker(TpModelWorker):
         # Tile-spec: automatic tile-aware speculation optimization
         self.enable_tile_spec = getattr(server_args, 'tile_spec', False)
         self.tile_spec_profiler = None
-        self.calibration = None
-        self.latency_model = None
-        self._profiling_scores = None
+        self.tile_spec_calibration = None
+        self.tile_spec_latency_model = None
+        self._tile_spec_scores = None
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -669,13 +669,13 @@ class EAGLEWorker(TpModelWorker):
             hidden_states = logits_output.hidden_states
 
         # Compute optimal k (tile-spec or fixed)
-        if self.enable_tile_spec and self.calibration and self.latency_model:
+        if self.enable_tile_spec and self.tile_spec_calibration and self.tile_spec_latency_model:
             # Concatenate scores for optimization
             scores_cat = torch.cat(score_list, dim=1).flatten(1)
             num_draft_tokens = compute_optimal_k(
                 scores_cat,
-                self.calibration,
-                self.latency_model,
+                self.tile_spec_calibration,
+                self.tile_spec_latency_model,
                 prefill_tokens=0,  # TODO: pass from batch for mixed batches
                 max_k=self.speculative_num_draft_tokens,
             )
@@ -685,7 +685,7 @@ class EAGLEWorker(TpModelWorker):
         # Store scores for calibration during profiling
         if self.enable_tile_spec and self.tile_spec_profiler and self.tile_spec_profiler.is_profiling():
             scores_cat = torch.cat(score_list, dim=1).flatten(1)
-            self._profiling_scores = scores_cat[:, :num_draft_tokens]
+            self._tile_spec_scores = scores_cat[:, :num_draft_tokens]
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, num_draft_tokens
@@ -793,7 +793,7 @@ class EAGLEWorker(TpModelWorker):
             num_tokens = spec_info.draft_token_num * len(batch.seq_lens)
 
             # Build accepted mask for calibration
-            scores = self._profiling_scores
+            scores = self._tile_spec_scores
             accepted = None
             if scores is not None:
                 bs = len(res.accept_length_per_req_cpu)
@@ -801,13 +801,13 @@ class EAGLEWorker(TpModelWorker):
                 accepted = torch.zeros(bs, draft_k, dtype=torch.bool, device=scores.device)
                 for i, acc_len in enumerate(res.accept_length_per_req_cpu):
                     accepted[i, :acc_len] = True
-                self._profiling_scores = None
+                self._tile_spec_scores = None
 
             self.tile_spec_profiler.record(num_tokens, latency_ms, scores, accepted)
 
             # Update worker models after profiling completes
-            if self.latency_model is None and self.tile_spec_profiler.latency_model is not None:
-                self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
+            if self.tile_spec_latency_model is None and self.tile_spec_profiler.latency_model is not None:
+                self.tile_spec_latency_model, self.tile_spec_calibration = self.tile_spec_profiler.get_models()
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
@@ -1134,9 +1134,9 @@ class EAGLEWorker(TpModelWorker):
         self.tile_spec_profiler = TileSpecProfiler(self.server_args)
 
         # Try to load from cache first
-        self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
+        self.tile_spec_latency_model, self.tile_spec_calibration = self.tile_spec_profiler.get_models()
 
-        if not self.latency_model:
+        if not self.tile_spec_latency_model:
             # Start profiling - data collected during warmup via verify() calls
             self.tile_spec_profiler.start_profiling()
 
