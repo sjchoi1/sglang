@@ -1626,7 +1626,7 @@ def _execute_server_warmup(
             headers=headers,
             timeout=120,
         ),
-        lambda: requests.get(url + "/get_server_info", timeout=5, headers=headers).json().get("tile_spec_ready", True),
+        lambda: requests.get(url + "/get_server_info", timeout=5, headers=headers).json().get("tile_spec_ready", False),
     )
 
     return success
