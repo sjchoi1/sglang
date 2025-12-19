@@ -560,11 +560,20 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch
             )
 
+        # Handle per-request draft tokens
+        per_request_draft_tokens = None
+        if isinstance(num_draft_tokens, torch.Tensor):
+            per_request_draft_tokens = num_draft_tokens
+            # Use max for tree building (tree needs uniform size)
+            num_draft_tokens_uniform = int(num_draft_tokens.max().item())
+        else:
+            num_draft_tokens_uniform = num_draft_tokens
+
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
-                num_draft_tokens,
+                num_draft_tokens_uniform,
             )
 
         (
@@ -583,7 +592,7 @@ class EAGLEWorker(TpModelWorker):
             batch.seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
-            num_draft_tokens,
+            num_draft_tokens_uniform,
         )
 
         return EagleVerifyInput(
@@ -596,10 +605,11 @@ class EAGLEWorker(TpModelWorker):
             retrive_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
-            draft_token_num=num_draft_tokens,
+            draft_token_num=num_draft_tokens_uniform,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
+            per_request_draft_token_num=per_request_draft_tokens,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -673,24 +683,32 @@ class EAGLEWorker(TpModelWorker):
             # Concatenate scores for optimization
             scores_cat = torch.cat(score_list, dim=1).flatten(1)
             bs = scores_cat.shape[0]
-            total_draft_tokens, _ = find_optimal_cutoff(
+            total_draft_tokens, per_request_draft_tokens = find_optimal_cutoff(
                 scores_cat,
                 self.tile_spec_calibration,
                 self.tile_spec_latency_model,
                 prefill_tokens=0,  # TODO: pass from batch for mixed batches
             )
-            # Convert total to per-request count (ceiling division)
-            # This respects tile boundaries while keeping uniform k for tree building
-            num_draft_tokens = (total_draft_tokens + bs - 1) // bs
-            # Clamp to valid range: at least 2 (1 verified + 1 draft), at most configured max
-            num_draft_tokens = max(2, min(num_draft_tokens, self.speculative_num_draft_tokens))
+            # Use per-request draft counts (with clamping per request)
+            per_request_draft_tokens = torch.clamp(
+                per_request_draft_tokens,
+                min=2,  # at least 2 (1 verified + 1 draft)
+                max=self.speculative_num_draft_tokens,
+            )
+            num_draft_tokens = per_request_draft_tokens
         else:
             num_draft_tokens = self.speculative_num_draft_tokens
 
         # Store cumulative scores for calibration during profiling
         if self.enable_tile_spec and self.tile_spec_profiler and self.tile_spec_profiler.is_profiling():
             scores_cat = torch.cat(score_list, dim=1).flatten(1)
-            self._tile_spec_scores = scores_cat[:, :num_draft_tokens]
+            if isinstance(num_draft_tokens, int):
+                self._tile_spec_scores = scores_cat[:, :num_draft_tokens]
+            else:
+                # For per-request counts, store up to max
+                max_k = int(num_draft_tokens.max().item())
+                self._tile_spec_scores = scores_cat[:, :max_k]
+                self._tile_spec_per_request_k = num_draft_tokens
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, num_draft_tokens
@@ -795,17 +813,35 @@ class EAGLEWorker(TpModelWorker):
         if _profile_start is not None:
             torch.cuda.synchronize()
             latency_ms = (time.perf_counter() - _profile_start) * 1000
-            num_tokens = spec_info.draft_token_num * len(batch.seq_lens)
+
+            # Handle per-request draft tokens
+            if spec_info.per_request_draft_token_num is not None:
+                num_tokens = int(spec_info.per_request_draft_token_num.sum().item())
+            else:
+                num_tokens = spec_info.draft_token_num * len(batch.seq_lens)
 
             # Build accepted mask for calibration
             scores = self._tile_spec_scores
             accepted = None
             if scores is not None:
                 bs = len(res.accept_length_per_req_cpu)
-                draft_k = spec_info.draft_token_num
-                accepted = torch.zeros(bs, draft_k, dtype=torch.bool, device=scores.device)
-                for i, acc_len in enumerate(res.accept_length_per_req_cpu):
-                    accepted[i, :acc_len] = True
+                if spec_info.per_request_draft_token_num is not None:
+                    # Per-request: build mask with variable widths
+                    per_request_k = getattr(self, '_tile_spec_per_request_k', None)
+                    if per_request_k is not None:
+                        max_k = int(per_request_k.max().item())
+                        accepted = torch.zeros(bs, max_k, dtype=torch.bool, device=scores.device)
+                        for i, acc_len in enumerate(res.accept_length_per_req_cpu):
+                            k_i = int(per_request_k[i].item())
+                            # Only mark accepted within the cutoff range
+                            accepted[i, :min(acc_len, k_i)] = True
+                        self._tile_spec_per_request_k = None
+                else:
+                    # Uniform: original logic
+                    draft_k = spec_info.draft_token_num
+                    accepted = torch.zeros(bs, draft_k, dtype=torch.bool, device=scores.device)
+                    for i, acc_len in enumerate(res.accept_length_per_req_cpu):
+                        accepted[i, :acc_len] = True
                 self._tile_spec_scores = None
 
             self.tile_spec_profiler.record(num_tokens, latency_ms, scores, accepted)

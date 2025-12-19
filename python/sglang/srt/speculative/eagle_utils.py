@@ -20,14 +20,38 @@ def organize_draft_results(
     score_list: List[torch.Tensor],
     token_list: List[torch.Tensor],
     parents_list: List[torch.Tensor],
-    num_draft_token: int,
+    num_draft_token,  # Can be int or torch.Tensor[bs]
 ):
-    score_list = torch.cat(score_list, dim=1).flatten(1)
+    score_list_cat = torch.cat(score_list, dim=1).flatten(1)
     ss_token_list = torch.cat(token_list, dim=1)
-    top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
-    top_scores_index = top_scores.indices
-    top_scores_index = torch.sort(top_scores_index).values
-    draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+
+    # Handle both uniform (int) and per-request (tensor) draft counts
+    if isinstance(num_draft_token, int):
+        # Original uniform logic
+        top_scores = torch.topk(score_list_cat, num_draft_token - 1, dim=-1)
+        top_scores_index = top_scores.indices
+        top_scores_index = torch.sort(top_scores_index).values
+        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+    else:
+        # Per-request logic: select different number of tokens per request
+        bs = score_list_cat.shape[0]
+        device = score_list_cat.device
+        per_request_k = num_draft_token  # [bs] tensor
+
+        # Get max k for padding
+        max_k = int(per_request_k.max().item()) - 1
+
+        # Select top-k per request, then mask invalid ones
+        top_scores_index = torch.full((bs, max_k), -1, dtype=torch.long, device=device)
+        draft_tokens = torch.full((bs, max_k), 0, dtype=ss_token_list.dtype, device=device)
+
+        for i in range(bs):
+            k_i = int(per_request_k[i].item()) - 1
+            if k_i > 0:
+                top_scores_i = torch.topk(score_list_cat[i], k_i, dim=-1)
+                indices_i = torch.sort(top_scores_i.indices).values
+                top_scores_index[i, :k_i] = indices_i
+                draft_tokens[i, :k_i] = ss_token_list[i, indices_i]
 
     if len(parents_list) > 1:
         parent_list = torch.cat(parents_list[:-1], dim=1)

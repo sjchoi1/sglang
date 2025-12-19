@@ -71,6 +71,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     # Shape info for padding
     num_tokens_per_batch: int = -1
 
+    # Per-request draft token counts (for TileSpec)
+    per_request_draft_token_num: torch.Tensor = None
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
 
