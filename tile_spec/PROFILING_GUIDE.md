@@ -10,11 +10,11 @@ cd /home/user/sglang/tile_spec
 ## What Happens
 
 ### 1. Profiling Coverage
-- **Batch sizes**: [1, 2, 4, 8, 16, 32, 64]
+- **Batch sizes**: [1, 2, 3, 4, ..., 128] (full range sweep)
 - **K value**: 8 (speculative-num-draft-tokens)
-- **Iterations**: 3 per batch size = 21 total warmup runs
-- **Token counts explored**: [8, 16, 32, 64, 128, 256, 512]
-- **Duration**: ~2-5 minutes
+- **Iterations**: 1 per batch size = 128 total warmup runs
+- **Token counts explored**: Comprehensive coverage from 8 to ~1024 tokens
+- **Duration**: ~5-10 minutes
 - **Min samples**: 70 with at least 6 unique token counts
 
 ### 2. Collected Data
@@ -63,10 +63,9 @@ After profiling completes:
 ## Configuration
 
 To adjust profiling parameters, edit `profiler.py`:
-- `WARMUP_BATCH_SIZES`: List of batch sizes to sweep
+- `WARMUP_BATCH_SIZES`: List of batch sizes to sweep (default: range(1, 129))
 - `min_samples`: Minimum total samples before auto-finish (default: 70)
 - `min_unique_counts`: Minimum unique token counts (default: 6)
-- `iterations_per_size`: Warmup runs per batch size (default: 3)
 
 ## Troubleshooting
 
@@ -75,8 +74,8 @@ To adjust profiling parameters, edit `profiler.py`:
 - Delete cache directory to force re-profiling
 
 **Issue**: Not enough samples
-- Increase `iterations_per_size` in profiler.py
-- Add more batch sizes to `WARMUP_BATCH_SIZES`
+- Expand the range of `WARMUP_BATCH_SIZES` in profiler.py
+- Decrease `min_samples` or `min_unique_counts` thresholds
 
 **Issue**: Visualizations not generated
 - Install matplotlib: `pip install matplotlib`

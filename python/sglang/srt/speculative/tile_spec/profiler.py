@@ -23,9 +23,9 @@ logger = logging.getLogger(__name__)
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
-# Comprehensive batch size sweep for profiling (5 min budget)
-# With K values 1-8, this explores: [1,2,3,4,5,6,7,8] * [1,2,4,8,16,32,64] token counts
-WARMUP_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+# Comprehensive batch size sweep for profiling - covers full range 1-128
+# With K values 1-8, this explores all token counts from 1 to ~1024
+WARMUP_BATCH_SIZES = list(range(1, 129))
 
 # Cache location: Find project root to avoid path nesting issues
 def _get_tile_spec_cache_root() -> Path:
@@ -111,29 +111,28 @@ def tile_spec_warmup(
         return
 
     logger.info("TileSpec: Running warmup profiling...")
-    logger.info(f"  Batch sizes: {WARMUP_BATCH_SIZES}")
-    logger.info(f"  Running 3 iterations per batch size for better coverage")
+    logger.info(f"  Batch sizes: 1 to {len(WARMUP_BATCH_SIZES)} (full sweep)")
+    logger.info(f"  Running single iteration per batch size for comprehensive coverage")
 
     # Load prompts from shared cache
     prompts = _load_prompts(limit=200)
 
-    # Run warmup with varying batch sizes (multiple iterations for better data)
-    iterations_per_size = 3
+    # Run warmup with varying batch sizes (single iteration for each size)
     idx = 0
     total_runs = 0
 
     for batch_size in WARMUP_BATCH_SIZES:
-        for iteration in range(iterations_per_size):
-            batch = prompts[idx:idx + batch_size]
-            idx = (idx + batch_size) % len(prompts)  # Wrap around if needed
-            if not batch:
-                break
-            try:
-                generate_fn(batch)
-                total_runs += 1
-                logger.info(f"TileSpec: Warmup bs={batch_size} iter={iteration+1}/{iterations_per_size} done (total: {total_runs})")
-            except Exception as e:
-                logger.warning(f"TileSpec: Warmup batch failed: {e}")
+        batch = prompts[idx:idx + batch_size]
+        idx = (idx + batch_size) % len(prompts)  # Wrap around if needed
+        if not batch:
+            break
+        try:
+            generate_fn(batch)
+            total_runs += 1
+            if batch_size % 16 == 0 or batch_size <= 10:  # Log less frequently
+                logger.info(f"TileSpec: Warmup bs={batch_size} done (total: {total_runs})")
+        except Exception as e:
+            logger.warning(f"TileSpec: Warmup batch failed: {e}")
 
     logger.info(f"TileSpec: Completed {total_runs} warmup runs")
 
