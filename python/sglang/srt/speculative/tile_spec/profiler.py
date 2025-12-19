@@ -162,8 +162,8 @@ def tile_spec_warmup(
                 wait_duration = time.time() - start_wait
                 logger.info(f"TileSpec: Profiling complete (waited {wait_duration:.1f}s)")
                 return
-        except Exception as e:
-            logger.warning(f"TileSpec: check_ready_fn() failed in loop: {e}")
+        except Exception:
+            pass
         time.sleep(1.0)
 
 
