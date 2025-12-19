@@ -292,15 +292,17 @@ class TileSpecProfiler:
             for s, a in zip(scores_np, accepted_np):
                 self._calibration_data.append((float(s), bool(a)))
 
+        # Auto-finish after collecting samples from all warmup batches
+        # With 64 batch sizes, we expect ~64 samples. Finish at 60 to ensure coverage.
+        if len(self._latency_data) >= 60:
+            logger.info(f"TileSpec: Auto-finishing profiling ({len(self._latency_data)} samples collected)")
+            self.finish_profiling()
+
     def finish_profiling(self):
         """Fit latency model from collected data."""
         if not self._profiling:
             return
         self._profiling = False
-
-        if len(self._latency_data) < 10:
-            logger.warning(f"TileSpec: Only {len(self._latency_data)} samples")
-            return
 
         # Aggregate by token count with outlier removal
         by_tokens = defaultdict(list)
