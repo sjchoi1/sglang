@@ -40,12 +40,24 @@ def get_cache_dir(model_path: str, gpu_name: str, tp_size: int) -> Path:
     return Path.home() / ".cache" / "sglang" / "tile_spec" / cache_name
 
 
-def _load_prompts(cache_dir: Path, limit: int = 100) -> List[str]:
+def _get_shared_cache_dir() -> Path:
+    """Get shared cache directory for datasets (not model-specific)."""
+    # Try project root first
+    current = Path(__file__).parent
+    while current != current.parent:
+        if (current / "tile_spec").exists():
+            return current / "tile_spec" / "cache"
+        current = current.parent
+    return Path.home() / ".cache" / "sglang" / "tile_spec"
+
+
+def _load_prompts(limit: int = 100) -> List[str]:
     """Load ShareGPT prompts for profiling warmup."""
-    sharegpt_path = cache_dir / "sharegpt.json"
+    shared_cache = _get_shared_cache_dir()
+    sharegpt_path = shared_cache / "sharegpt.json"
 
     if not sharegpt_path.exists():
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        shared_cache.mkdir(parents=True, exist_ok=True)
         try:
             logger.info("TileSpec: Downloading ShareGPT dataset...")
             urllib.request.urlretrieve(SHAREGPT_URL, sharegpt_path)
@@ -94,13 +106,8 @@ def tile_spec_warmup(
 
     logger.info("TileSpec: Running warmup profiling...")
 
-    # Load prompts
-    cache_dir = get_cache_dir(
-        server_args.model_path,
-        torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
-        server_args.tp_size,
-    )
-    prompts = _load_prompts(cache_dir, limit=100)
+    # Load prompts from shared cache
+    prompts = _load_prompts(limit=100)
 
     # Run warmup with varying batch sizes
     idx = 0
