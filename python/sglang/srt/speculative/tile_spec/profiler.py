@@ -81,11 +81,21 @@ def tile_spec_warmup(
         check_ready_fn: Function that returns True when profiling is complete
         max_wait: Maximum seconds to wait for profiling to complete
     """
+    logger.info(f"TileSpec: warmup called, tile_spec={getattr(server_args, 'tile_spec', False)}")
     if not getattr(server_args, 'tile_spec', False):
+        logger.info("TileSpec: Skipping warmup (not enabled)")
         return
 
     # Check if already profiled (cached)
-    if check_ready_fn():
+    try:
+        is_ready = check_ready_fn()
+        logger.info(f"TileSpec: check_ready_fn() = {is_ready}")
+    except Exception as e:
+        logger.warning(f"TileSpec: check_ready_fn() failed: {e}")
+        is_ready = False
+
+    if is_ready:
+        logger.info("TileSpec: Already profiled, skipping warmup")
         return
 
     logger.info("TileSpec: Running warmup profiling...")
