@@ -50,9 +50,9 @@ class StandaloneWorker(EAGLEWorker):
         # Tile-spec: automatic tile-aware speculation optimization
         self.enable_tile_spec = getattr(server_args, 'tile_spec', False)
         self.tile_spec_profiler = None
-        self.calibration = None
-        self.latency_model = None
-        self._profiling_scores = None
+        self.tile_spec_calibration = None
+        self.tile_spec_latency_model = None
+        self._tile_spec_scores = None
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
