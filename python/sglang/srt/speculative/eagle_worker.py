@@ -905,15 +905,22 @@ class EAGLEWorker(TpModelWorker):
             if scores is not None:
                 bs = len(res.accept_length_per_req_cpu)
                 if spec_info.per_request_draft_token_num is not None:
-                    # Per-request: build mask with variable widths
+                    # Per-request: collect only valid positions (NO PADDING)
                     per_request_k = getattr(self, '_tile_spec_per_request_k', None)
                     if per_request_k is not None:
-                        max_k = int(per_request_k.max().item())
-                        accepted = torch.zeros(bs, max_k, dtype=torch.bool, device=scores.device)
+                        # Collect valid score/accepted pairs per request, then concatenate
+                        scores_list = []
+                        accepted_list = []
                         for i, acc_len in enumerate(res.accept_length_per_req_cpu):
                             k_i = int(per_request_k[i].item())
-                            # Only mark accepted within the cutoff range
-                            accepted[i, :min(acc_len, k_i)] = True
+                            # Only include valid positions up to k_i
+                            scores_list.append(scores[i, :k_i])
+                            accepted_i = torch.zeros(k_i, dtype=torch.bool, device=scores.device)
+                            accepted_i[:min(acc_len, k_i)] = True
+                            accepted_list.append(accepted_i)
+                        # Concatenate into 1D arrays (no padding)
+                        scores = torch.cat(scores_list, dim=0).unsqueeze(0)  # [1, total_valid]
+                        accepted = torch.cat(accepted_list, dim=0).unsqueeze(0)  # [1, total_valid]
                         self._tile_spec_per_request_k = None
                 else:
                     # Uniform: original logic
