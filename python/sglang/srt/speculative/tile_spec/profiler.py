@@ -362,14 +362,58 @@ class TileSpecProfiler:
         self.latency_model.save(str(self.cache_dir / "latency_model.npz"))
         self.calibration.save(str(self.cache_dir / "calibration.npz"))
 
+        # Save raw data to CSV files
+        self._save_csv_data(by_tokens_clean, outliers)
+
         # Generate and save visualizations
-        self._save_visualizations(token_counts, latencies, by_tokens)
+        self._save_visualizations(token_counts, latencies, by_tokens_clean, outliers)
 
         logger.info(f"TileSpec: Complete, boundaries={self.latency_model.boundaries}")
         self._latency_data.clear()
         self._calibration_data.clear()
 
-    def _save_visualizations(self, token_counts, latencies, by_tokens):
+    def _save_csv_data(self, by_tokens_clean, outliers):
+        """Save raw profiling data to CSV files."""
+        import csv
+
+        csv_dir = self.cache_dir / "csv"
+        csv_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Save latency data (clean samples)
+        latency_csv = csv_dir / "latency_data.csv"
+        with open(latency_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['token_count', 'latency_ms'])
+            for token_count in sorted(by_tokens_clean.keys()):
+                for latency in by_tokens_clean[token_count]:
+                    writer.writerow([token_count, latency])
+
+        # 2. Save outliers if any exist
+        total_outliers = sum(len(o) for o in outliers.values())
+        if total_outliers > 0:
+            outliers_csv = csv_dir / "latency_outliers.csv"
+            with open(outliers_csv, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['token_count', 'latency_ms'])
+                for token_count in sorted(outliers.keys()):
+                    for latency in outliers[token_count]:
+                        writer.writerow([token_count, latency])
+
+        # 3. Save calibration data
+        if self._calibration_data:
+            cal_csv = csv_dir / "calibration_data.csv"
+            with open(cal_csv, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['cumulative_score', 'accepted'])
+                for score, accepted in self._calibration_data:
+                    writer.writerow([score, int(accepted)])
+            logger.info(f"TileSpec: Saved {len(self._calibration_data)} calibration samples to CSV")
+        else:
+            logger.warning("TileSpec: No calibration data collected!")
+
+        logger.info(f"TileSpec: Saved CSV data to {csv_dir}")
+
+    def _save_visualizations(self, token_counts, latencies, by_tokens_clean, outliers):
         """Generate and save profiling visualizations as PNG."""
         try:
             import matplotlib
@@ -383,31 +427,44 @@ class TileSpecProfiler:
         plots_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Latency Model Plot
-        self._plot_latency_model(token_counts, latencies, by_tokens, plots_dir)
+        self._plot_latency_model(token_counts, latencies, by_tokens_clean, outliers, plots_dir)
 
         # 2. Calibration Plot
         if self._calibration_data:
+            logger.info(f"TileSpec: Generating calibration plots ({len(self._calibration_data)} samples)...")
             self._plot_calibration(plots_dir)
             self._plot_calibration_accuracy(plots_dir)
+        else:
+            logger.warning("TileSpec: No calibration data - skipping calibration plots")
 
         # 3. Token Distribution Plot
-        self._plot_token_distribution(by_tokens, plots_dir)
+        self._plot_token_distribution(by_tokens_clean, plots_dir)
 
         logger.info(f"TileSpec: Saved visualizations to {plots_dir}")
 
-    def _plot_latency_model(self, token_counts, latencies, by_tokens, plots_dir):
+    def _plot_latency_model(self, token_counts, latencies, by_tokens_clean, outliers, plots_dir):
         """Plot latency model with raw samples, fitted model, and boundaries."""
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(10, 6))
 
-        # Plot all raw samples (scatter)
+        # Plot clean samples (scatter)
         all_tokens = []
         all_lats = []
-        for n, lat in by_tokens.items():
+        for n, lat in by_tokens_clean.items():
             all_tokens.extend([n] * len(lat))
             all_lats.extend(lat)
-        ax.scatter(all_tokens, all_lats, alpha=0.3, s=20, label='Raw samples')
+        ax.scatter(all_tokens, all_lats, alpha=0.4, s=20, label='Clean samples', color='blue')
+
+        # Plot outliers if any
+        outlier_tokens = []
+        outlier_lats = []
+        for n, lat in outliers.items():
+            outlier_tokens.extend([n] * len(lat))
+            outlier_lats.extend(lat)
+        if outlier_tokens:
+            ax.scatter(outlier_tokens, outlier_lats, alpha=0.6, s=30, label='Outliers (removed)',
+                      color='red', marker='x')
 
         # Plot aggregated medians
         ax.plot(token_counts, latencies, 'o-', linewidth=2, markersize=8, label='Median latency')
