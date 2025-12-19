@@ -2,7 +2,7 @@
 Tile-Spec Profiler - Automatic profiling during warmup.
 
 Profiles latency by recording actual verify() calls.
-Cache structure: ~/.cache/sglang/tile_spec/{model}_{gpu}_tp{N}/
+Cache structure: tile_spec/cache/{model}_{gpu}_tp{N}/
 """
 
 import json
@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 WARMUP_BATCH_SIZES = [1, 4, 16, 64]
 
-# Cache location: ~/.cache/sglang/tile_spec/
-TILE_SPEC_CACHE_ROOT = Path.home() / ".cache" / "sglang" / "tile_spec"
+# Cache location: tile_spec/cache/ (relative to cwd, easy to find for visualization)
+TILE_SPEC_CACHE_ROOT = Path("tile_spec/cache")
 
 
 def get_cache_dir(model_path: str, gpu_name: str, tp_size: int) -> Path:
