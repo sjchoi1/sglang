@@ -2380,11 +2380,15 @@ class Scheduler(
             profiler = getattr(self.draft_worker, "tile_spec_profiler", None)
             if profiler is not None:
                 # Ready when latency model exists
-                ret["tile_spec_ready"] = profiler.latency_model is not None
+                has_model = profiler.latency_model is not None
+                ret["tile_spec_ready"] = has_model
+                logger.info(f"TileSpec: profiler exists, latency_model={'exists' if has_model else 'None'}, tile_spec_ready={has_model}")
             else:
                 ret["tile_spec_ready"] = False  # Profiler not created yet
+                logger.info("TileSpec: profiler is None, tile_spec_ready=False")
         else:
             ret["tile_spec_ready"] = False  # Draft worker not ready yet
+            logger.info(f"TileSpec: draft_worker not ready, tile_spec_ready=False (has_draft_worker={hasattr(self, 'draft_worker')}, is_none={getattr(self, 'draft_worker', None) is None})")
 
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
