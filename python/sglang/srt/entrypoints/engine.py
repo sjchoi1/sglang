@@ -83,6 +83,7 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.speculative.tile_spec import tile_spec_warmup
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -262,10 +263,9 @@ class Engine(EngineBase):
             asyncio.set_event_loop(self.loop)
 
         # TileSpec warmup (if enabled)
-        from sglang.srt.speculative.tile_spec import tile_spec_warmup
         tile_spec_warmup(
             self.server_args,
-            lambda prompts: self.generate(prompts, sampling_params={"temperature": 0.8, "max_new_tokens": 64}),
+            lambda prompts: self.generate(prompts, sampling_params={"temperature": 0, "max_new_tokens": 64}),
             self.tile_spec_ready,
         )
 
