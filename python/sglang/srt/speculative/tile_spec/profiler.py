@@ -39,11 +39,11 @@ _original_log_levels = {}
 
 def _suppress_profiling_logs():
     """Temporarily suppress verbose logs during profiling."""
-    import os
     global _original_log_levels
 
-    # Set environment variable to signal scheduler subprocess to suppress logs
-    os.environ["SGLANG_TILE_SPEC_PROFILING"] = "1"
+    # Create flag file to signal scheduler subprocess to suppress logs
+    flag_file = Path("/tmp/.sglang_tile_spec_profiling")
+    flag_file.touch()
 
     # Suppress uvicorn access logs (HTTP 200 OK messages)
     uvicorn_logger = logging.getLogger("uvicorn.access")
@@ -52,11 +52,11 @@ def _suppress_profiling_logs():
 
 def _restore_profiling_logs():
     """Restore original logging levels after profiling."""
-    import os
     global _original_log_levels
 
-    # Clear environment variable
-    os.environ.pop("SGLANG_TILE_SPEC_PROFILING", None)
+    # Remove flag file
+    flag_file = Path("/tmp/.sglang_tile_spec_profiling")
+    flag_file.unlink(missing_ok=True)
 
     if "uvicorn" in _original_log_levels:
         logging.getLogger("uvicorn.access").setLevel(_original_log_levels["uvicorn"])

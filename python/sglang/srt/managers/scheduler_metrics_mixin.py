@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
@@ -25,7 +25,7 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 
 def _is_tile_spec_profiling() -> bool:
     """Check if TileSpec profiling is active (suppress batch logs)."""
-    return os.environ.get("SGLANG_TILE_SPEC_PROFILING") == "1"
+    return Path("/tmp/.sglang_tile_spec_profiling").exists()
 
 
 class KvMetrics:
