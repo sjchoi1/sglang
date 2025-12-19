@@ -22,7 +22,10 @@ from sglang.srt.speculative.tile_spec.core import Calibration, PiecewiseLinearLa
 logger = logging.getLogger(__name__)
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
-WARMUP_BATCH_SIZES = [1, 4, 16, 64]
+
+# Comprehensive batch size sweep for profiling (5 min budget)
+# With K values 1-8, this explores: [1,2,3,4,5,6,7,8] * [1,2,4,8,16,32,64] token counts
+WARMUP_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 # Cache location: Find project root to avoid path nesting issues
 def _get_tile_spec_cache_root() -> Path:
@@ -108,22 +111,31 @@ def tile_spec_warmup(
         return
 
     logger.info("TileSpec: Running warmup profiling...")
+    logger.info(f"  Batch sizes: {WARMUP_BATCH_SIZES}")
+    logger.info(f"  Running 3 iterations per batch size for better coverage")
 
     # Load prompts from shared cache
-    prompts = _load_prompts(limit=100)
+    prompts = _load_prompts(limit=200)
 
-    # Run warmup with varying batch sizes
+    # Run warmup with varying batch sizes (multiple iterations for better data)
+    iterations_per_size = 3
     idx = 0
+    total_runs = 0
+
     for batch_size in WARMUP_BATCH_SIZES:
-        batch = prompts[idx:idx + batch_size]
-        idx += batch_size
-        if not batch:
-            break
-        try:
-            generate_fn(batch)
-            logger.info(f"TileSpec: Warmup batch_size={batch_size} done")
-        except Exception as e:
-            logger.warning(f"TileSpec: Warmup batch failed: {e}")
+        for iteration in range(iterations_per_size):
+            batch = prompts[idx:idx + batch_size]
+            idx = (idx + batch_size) % len(prompts)  # Wrap around if needed
+            if not batch:
+                break
+            try:
+                generate_fn(batch)
+                total_runs += 1
+                logger.info(f"TileSpec: Warmup bs={batch_size} iter={iteration+1}/{iterations_per_size} done (total: {total_runs})")
+            except Exception as e:
+                logger.warning(f"TileSpec: Warmup batch failed: {e}")
+
+    logger.info(f"TileSpec: Completed {total_runs} warmup runs")
 
     # Wait for profiling to complete (auto-finishes when enough samples)
     for _ in range(max_wait):
@@ -138,7 +150,7 @@ def tile_spec_warmup(
 class TileSpecProfiler:
     """Profiles tile-spec latency using actual sglang runs."""
 
-    def __init__(self, server_args, min_samples: int = 50):
+    def __init__(self, server_args, min_samples: int = 70):
         self.server_args = server_args
         self.cache_dir = get_cache_dir(
             server_args.model_path,
@@ -146,6 +158,7 @@ class TileSpecProfiler:
             server_args.tp_size,
         )
         self.min_samples = min_samples
+        self.min_unique_counts = 6  # Require at least 6 different token counts
         self._profiling = False
         self._latency_data: List[Tuple[int, float]] = []
         self._calibration_data: List[Tuple[float, bool]] = []
@@ -208,7 +221,8 @@ class TileSpecProfiler:
         # Auto-finish when enough diverse samples
         if len(self._latency_data) >= self.min_samples:
             unique = len(set(t for t, _ in self._latency_data))
-            if unique >= 4:
+            if unique >= self.min_unique_counts:
+                logger.info(f"TileSpec: Auto-finishing profiling ({len(self._latency_data)} samples, {unique} unique token counts)")
                 self.finish_profiling()
 
     def finish_profiling(self):
@@ -248,6 +262,135 @@ class TileSpecProfiler:
         self.latency_model.save(str(self.cache_dir / "latency_model.npz"))
         self.calibration.save(str(self.cache_dir / "calibration.npz"))
 
+        # Generate and save visualizations
+        self._save_visualizations(token_counts, latencies, by_tokens)
+
         logger.info(f"TileSpec: Complete, boundaries={self.latency_model.boundaries}")
         self._latency_data.clear()
         self._calibration_data.clear()
+
+    def _save_visualizations(self, token_counts, latencies, by_tokens):
+        """Generate and save profiling visualizations as PNG."""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # Non-interactive backend
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logger.warning("matplotlib not available, skipping visualizations")
+            return
+
+        plots_dir = self.cache_dir / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Latency Model Plot
+        self._plot_latency_model(token_counts, latencies, by_tokens, plots_dir)
+
+        # 2. Calibration Plot
+        if self._calibration_data:
+            self._plot_calibration(plots_dir)
+
+        # 3. Token Distribution Plot
+        self._plot_token_distribution(by_tokens, plots_dir)
+
+        logger.info(f"TileSpec: Saved visualizations to {plots_dir}")
+
+    def _plot_latency_model(self, token_counts, latencies, by_tokens, plots_dir):
+        """Plot latency model with raw samples, fitted model, and boundaries."""
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        # Plot all raw samples (scatter)
+        all_tokens = []
+        all_lats = []
+        for n, lat in by_tokens.items():
+            all_tokens.extend([n] * len(lat))
+            all_lats.extend(lat)
+        ax.scatter(all_tokens, all_lats, alpha=0.3, s=20, label='Raw samples')
+
+        # Plot aggregated medians
+        ax.plot(token_counts, latencies, 'o-', linewidth=2, markersize=8, label='Median latency')
+
+        # Plot fitted piecewise model
+        if self.latency_model:
+            max_tokens = max(token_counts)
+            fit_x = np.arange(1, max_tokens + 1)
+            fit_y = [self.latency_model.predict(n) for n in fit_x]
+            ax.plot(fit_x, fit_y, '--', linewidth=1.5, alpha=0.7, label='Fitted model')
+
+            # Mark tile boundaries
+            for boundary in self.latency_model.boundaries:
+                if boundary <= max_tokens:
+                    ax.axvline(boundary, color='red', linestyle=':', alpha=0.5, linewidth=1)
+
+        ax.set_xlabel('Total Tokens', fontsize=12)
+        ax.set_ylabel('Latency (ms)', fontsize=12)
+        ax.set_title('TileSpec Latency Model', fontsize=14, fontweight='bold')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'latency_model.png', dpi=150)
+        plt.close()
+
+    def _plot_calibration(self, plots_dir):
+        """Plot calibration curve: score vs P(accept)."""
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        # Bin scores and compute acceptance rate
+        cal_scores = np.array([s for s, _ in self._calibration_data])
+        cal_accepted = np.array([a for _, a in self._calibration_data])
+
+        # Create bins
+        n_bins = 50
+        bins = np.linspace(cal_scores.min(), cal_scores.max(), n_bins)
+        bin_indices = np.digitize(cal_scores, bins)
+
+        bin_centers = []
+        acceptance_rates = []
+        for i in range(1, len(bins)):
+            mask = bin_indices == i
+            if mask.sum() > 0:
+                bin_centers.append((bins[i-1] + bins[i]) / 2)
+                acceptance_rates.append(cal_accepted[mask].mean())
+
+        # Plot empirical acceptance rate
+        ax.scatter(bin_centers, acceptance_rates, alpha=0.6, s=30, label='Empirical')
+
+        # Plot fitted calibration curve
+        if self.calibration:
+            score_range = np.linspace(cal_scores.min(), cal_scores.max(), 200)
+            score_tensor = torch.tensor(score_range, dtype=torch.float32)
+            fitted_probs = self.calibration.predict(score_tensor).cpu().numpy()
+            ax.plot(score_range, fitted_probs, '-', linewidth=2, label='Fitted model')
+
+        ax.set_xlabel('Cumulative Draft Score', fontsize=12)
+        ax.set_ylabel('P(Accept)', fontsize=12)
+        ax.set_title('TileSpec Calibration Curve', fontsize=14, fontweight='bold')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'calibration.png', dpi=150)
+        plt.close()
+
+    def _plot_token_distribution(self, by_tokens, plots_dir):
+        """Plot distribution of token counts profiled."""
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        token_counts = sorted(by_tokens.keys())
+        sample_counts = [len(by_tokens[t]) for t in token_counts]
+
+        ax.bar(token_counts, sample_counts, alpha=0.7, edgecolor='black')
+        ax.set_xlabel('Total Tokens', fontsize=12)
+        ax.set_ylabel('Number of Samples', fontsize=12)
+        ax.set_title('Profiling Coverage', fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3, axis='y')
+
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'token_distribution.png', dpi=150)
+        plt.close()
