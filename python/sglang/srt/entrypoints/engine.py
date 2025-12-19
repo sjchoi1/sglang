@@ -550,10 +550,14 @@ class Engine(EngineBase):
             self.tokenizer_manager.get_internal_state()
         )
         # Check all DP ranks (usually just one)
-        for state in internal_states:
+        for i, state in enumerate(internal_states):
+            tile_spec_ready = state.get("tile_spec_ready", False)
+            logger.info(f"TileSpec: tile_spec_ready() checking state[{i}]: tile_spec_ready={tile_spec_ready}")
             # Default to False (not ready) if key doesn't exist
-            if not state.get("tile_spec_ready", False):
+            if not tile_spec_ready:
+                logger.info(f"TileSpec: tile_spec_ready() returning False (state[{i}] not ready)")
                 return False
+        logger.info("TileSpec: tile_spec_ready() returning True (all states ready)")
         return True
 
     def init_weights_update_group(
