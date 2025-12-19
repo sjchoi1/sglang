@@ -133,16 +133,15 @@ def tile_spec_warmup(
         logger.info("TileSpec: Skipping warmup (not enabled)")
         return
 
-    # Check if already profiled (cached)
-    try:
-        is_ready = check_ready_fn()
-        logger.info(f"TileSpec: check_ready_fn() = {is_ready}")
-    except Exception as e:
-        logger.warning(f"TileSpec: check_ready_fn() failed: {e}")
-        is_ready = False
-
-    if is_ready:
-        logger.info("TileSpec: Already profiled, skipping warmup")
+    # Check if cache exists (direct filesystem check to avoid race conditions)
+    cache_dir = get_cache_dir(
+        server_args.model_path,
+        torch.cuda.get_device_name(0),
+        server_args.tp_size,
+    )
+    latency_cache = cache_dir / "latency_model.npz"
+    if latency_cache.exists():
+        logger.info(f"TileSpec: Cache exists at {latency_cache}, skipping warmup")
         return
 
     logger.info("TileSpec: Running warmup profiling...")
