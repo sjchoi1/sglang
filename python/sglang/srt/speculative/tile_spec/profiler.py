@@ -173,8 +173,10 @@ def tile_spec_warmup(
             # Set draft token count if callback provided
             if set_draft_fn is not None and draft_value is not None:
                 try:
+                    logger.info(f"TileSpec: Setting draft tokens to {draft_value}")
                     set_draft_fn(draft_value)
                     pbar.set_postfix({"draft": draft_value})
+                    logger.info(f"TileSpec: Draft tokens set to {draft_value}")
                 except Exception as e:
                     logger.warning(f"TileSpec: Failed to set draft={draft_value}: {e}")
                     continue
