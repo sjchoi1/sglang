@@ -562,38 +562,108 @@ class EAGLEWorker(TpModelWorker):
 
         # Handle per-request draft tokens
         per_request_draft_tokens = None
-        if isinstance(num_draft_tokens, torch.Tensor):
+        is_per_request_mode = isinstance(top_scores_index, list)
+
+        if is_per_request_mode:
+            # Per-request mode: build trees separately for each request (NO PADDING)
             per_request_draft_tokens = num_draft_tokens
-            # Use max for tree building (tree needs uniform size)
-            num_draft_tokens_uniform = int(num_draft_tokens.max().item())
+            bs = len(top_scores_index)
         else:
-            num_draft_tokens_uniform = num_draft_tokens
+            # Uniform mode
+            if isinstance(num_draft_tokens, torch.Tensor):
+                per_request_draft_tokens = num_draft_tokens
+                num_draft_tokens = int(num_draft_tokens.max().item())
 
         if batch.forward_mode.is_idle():
+            num_tokens_for_idle = num_draft_tokens if isinstance(num_draft_tokens, int) else int(num_draft_tokens.max().item())
             return EagleVerifyInput.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
-                num_draft_tokens_uniform,
+                num_tokens_for_idle,
             )
 
-        (
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            spec_info.verified_id,
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            batch.seq_lens,
-            batch.seq_lens_sum,
-            self.topk,
-            self.speculative_num_steps,
-            num_draft_tokens_uniform,
-        )
+        if is_per_request_mode:
+            # Build per-request trees and concatenate
+            all_tree_masks = []
+            all_positions = []
+            all_retrive_indices = []
+            all_retrive_next_tokens = []
+            all_retrive_next_siblings = []
+            all_draft_tokens = []
+
+            total_tokens = 0
+            per_request_offsets = [0]
+
+            for i in range(bs):
+                k_i = int(per_request_draft_tokens[i].item())
+
+                # Extract parent list for this request
+                if len(parent_list.shape) == 2:
+                    parent_list_i = parent_list[i:i+1]
+                else:
+                    parent_list_i = torch.empty(1, 0, device=parent_list.device)
+
+                # Build tree for this request with exact k_i tokens
+                (
+                    tree_mask_i,
+                    position_i,
+                    retrive_index_i,
+                    retrive_next_token_i,
+                    retrive_next_sibling_i,
+                    draft_tokens_i,
+                ) = build_tree_kernel_efficient(
+                    spec_info.verified_id[i:i+1],
+                    parent_list_i,
+                    top_scores_index[i].unsqueeze(0),
+                    draft_tokens[i].unsqueeze(0),
+                    batch.seq_lens[i:i+1],
+                    batch.seq_lens[i].item(),
+                    self.topk,
+                    self.speculative_num_steps,
+                    k_i,
+                )
+
+                all_tree_masks.append(tree_mask_i)
+                all_positions.append(position_i)
+                all_retrive_indices.append(retrive_index_i)
+                all_retrive_next_tokens.append(retrive_next_token_i)
+                all_retrive_next_siblings.append(retrive_next_sibling_i)
+                all_draft_tokens.append(draft_tokens_i)
+
+                total_tokens += k_i
+                per_request_offsets.append(total_tokens)
+
+            # Concatenate all outputs globally
+            tree_mask = torch.cat(all_tree_masks, dim=0)
+            position = torch.cat(all_positions, dim=0)
+            retrive_index = torch.cat(all_retrive_indices, dim=0)
+            retrive_next_token = torch.cat(all_retrive_next_tokens, dim=0)
+            retrive_next_sibling = torch.cat(all_retrive_next_siblings, dim=0)
+            draft_tokens = torch.cat(all_draft_tokens, dim=0)
+
+            # Store offsets for verification
+            draft_token_num = total_tokens
+        else:
+            # Uniform mode: original single call
+            (
+                tree_mask,
+                position,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
+                spec_info.verified_id,
+                parent_list,
+                top_scores_index,
+                draft_tokens,
+                batch.seq_lens,
+                batch.seq_lens_sum,
+                self.topk,
+                self.speculative_num_steps,
+                num_draft_tokens,
+            )
+            draft_token_num = num_draft_tokens
 
         return EagleVerifyInput(
             draft_token=draft_tokens,
@@ -605,7 +675,7 @@ class EAGLEWorker(TpModelWorker):
             retrive_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
-            draft_token_num=num_draft_tokens_uniform,
+            draft_token_num=draft_token_num,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,

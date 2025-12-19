@@ -33,25 +33,28 @@ def organize_draft_results(
         top_scores_index = torch.sort(top_scores_index).values
         draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
     else:
-        # Per-request logic: select different number of tokens per request
+        # Per-request logic: select EXACT number of tokens per request (NO PADDING)
+        # Returns lists of per-request results to be processed separately
         bs = score_list_cat.shape[0]
-        device = score_list_cat.device
         per_request_k = num_draft_token  # [bs] tensor
 
-        # Get max k for padding
-        max_k = int(per_request_k.max().item()) - 1
-
-        # Select top-k per request, then mask invalid ones
-        top_scores_index = torch.full((bs, max_k), -1, dtype=torch.long, device=device)
-        draft_tokens = torch.full((bs, max_k), 0, dtype=ss_token_list.dtype, device=device)
+        top_scores_index = []
+        draft_tokens = []
 
         for i in range(bs):
             k_i = int(per_request_k[i].item()) - 1
             if k_i > 0:
                 top_scores_i = torch.topk(score_list_cat[i], k_i, dim=-1)
                 indices_i = torch.sort(top_scores_i.indices).values
-                top_scores_index[i, :k_i] = indices_i
-                draft_tokens[i, :k_i] = ss_token_list[i, indices_i]
+                top_scores_index.append(indices_i)
+                draft_tokens.append(ss_token_list[i, indices_i])
+            else:
+                # At least return empty tensors for consistency
+                top_scores_index.append(torch.empty(0, dtype=torch.long, device=score_list_cat.device))
+                draft_tokens.append(torch.empty(0, dtype=ss_token_list.dtype, device=score_list_cat.device))
+
+        # Return as lists for per-request processing (will be handled in draft())
+        # Don't concatenate here - let caller build trees per-request
 
     if len(parents_list) > 1:
         parent_list = torch.cat(parents_list[:-1], dim=1)
