@@ -87,6 +87,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.speculative.tile_spec import tile_spec_warmup
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CheckWeightsReqInput,
@@ -1617,12 +1618,11 @@ def _execute_server_warmup(
     # logger.info(f"warmup request returns: {res.json()=}")
 
     # TileSpec warmup (if enabled)
-    from sglang.srt.speculative.tile_spec import tile_spec_warmup
     tile_spec_warmup(
         server_args,
         lambda prompts: requests.post(
             url + "/generate",
-            json={"text": prompts, "sampling_params": {"temperature": 0.8, "max_new_tokens": 64}},
+            json={"text": prompts, "sampling_params": {"temperature": 0, "max_new_tokens": 64}},
             headers=headers,
             timeout=120,
         ),
