@@ -1,7 +1,7 @@
 """
 Core tile-aware speculation algorithms.
 
-- Calibration: maps cumulative draft scores to acceptance probabilities
+- Calibration: maps per-position draft scores to acceptance probabilities (linear regression)
 - PiecewiseLinearLatency: models verification latency with tile boundaries
 - compute_optimal_k: finds optimal draft token count maximizing E/Latency
 """
@@ -13,47 +13,64 @@ import torch
 
 
 class Calibration:
-    """Maps cumulative draft confidence to acceptance probability."""
+    """Maps per-position draft scores to acceptance probability using linear regression."""
 
-    def __init__(self, num_bins: int = 50):
-        self.num_bins = num_bins
-        self.bin_edges = np.linspace(0, 1, num_bins + 1)
-        self.bin_probs = np.ones(num_bins) * 0.5  # default
-        self._tensor_probs = None
+    def __init__(self):
+        # Linear regression: P(accept) = slope * score + intercept
+        self.slope = 1.0  # default: identity-ish mapping
+        self.intercept = 0.0
+        self._slope_tensor = None
+        self._intercept_tensor = None
         self._device = None
 
     def fit(self, scores: np.ndarray, accepted: np.ndarray):
-        """Fit calibration from collected data."""
-        for i in range(self.num_bins):
-            lo, hi = self.bin_edges[i], self.bin_edges[i + 1]
-            mask = (scores >= lo) & (scores < hi)
-            if mask.sum() > 0:
-                self.bin_probs[i] = accepted[mask].mean()
-        self._tensor_probs = None  # invalidate cache
+        """Fit linear regression from collected (per-position score, accepted) pairs."""
+        if len(scores) < 2:
+            return
+
+        # Simple linear regression: y = a*x + b
+        x_mean = scores.mean()
+        y_mean = accepted.mean()
+
+        # Compute slope: cov(x,y) / var(x)
+        numerator = ((scores - x_mean) * (accepted - y_mean)).sum()
+        denominator = ((scores - x_mean) ** 2).sum()
+
+        if denominator > 1e-9:
+            self.slope = float(numerator / denominator)
+            self.intercept = float(y_mean - self.slope * x_mean)
+        else:
+            # Fallback if no variance in scores
+            self.slope = 0.0
+            self.intercept = float(y_mean)
+
+        # Invalidate cached tensors
+        self._slope_tensor = None
+        self._intercept_tensor = None
 
     def predict(self, scores: torch.Tensor) -> torch.Tensor:
-        """Map scores to acceptance probabilities."""
+        """Map per-position scores to acceptance probabilities."""
         device = scores.device
 
-        # Cache tensor on device
-        if self._tensor_probs is None or self._device != device:
-            self._tensor_probs = torch.from_numpy(self.bin_probs).float().to(device)
+        # Cache tensors on device
+        if self._slope_tensor is None or self._device != device:
+            self._slope_tensor = torch.tensor(self.slope, dtype=torch.float32, device=device)
+            self._intercept_tensor = torch.tensor(self.intercept, dtype=torch.float32, device=device)
             self._device = device
 
-        # Clamp and bucketize
-        scores_clamped = scores.clamp(0, 1 - 1e-6)
-        bin_idx = (scores_clamped * self.num_bins).long().clamp(0, self.num_bins - 1)
-        return self._tensor_probs[bin_idx]
+        # Linear prediction with clamp to [0.01, 0.99]
+        probs = self._slope_tensor * scores + self._intercept_tensor
+        return probs.clamp(0.01, 0.99)
 
     def save(self, path: str):
-        np.savez(path, bin_edges=self.bin_edges, bin_probs=self.bin_probs)
+        np.savez(path, slope=self.slope, intercept=self.intercept)
 
     def load(self, path: str):
         data = np.load(path)
-        self.bin_edges = data["bin_edges"]
-        self.bin_probs = data["bin_probs"]
-        self.num_bins = len(self.bin_probs)
-        self._tensor_probs = None
+        self.slope = float(data["slope"])
+        self.intercept = float(data["intercept"])
+        self._slope_tensor = None
+        self._intercept_tensor = None
 
 
 class PiecewiseLinearLatency:
@@ -193,9 +210,15 @@ def compute_optimal_k(
     """
     Find optimal draft token count maximizing E[accepted] / Latency.
 
+    Uses per-position scores with cumulative probability computation:
+    1. Convert cumulative scores to per-position scores
+    2. Calibrate per-position scores to acceptance probabilities
+    3. Compute cumulative probability via cumprod
+    4. Sort globally and find optimal k
+
     Args:
         score_list: [bs, n_candidates] cumulative draft scores
-        calibration: maps scores to acceptance probability
+        calibration: maps per-position scores to acceptance probability
         latency_model: piecewise linear latency predictor
         prefill_tokens: tokens from prefill (for mixed batches)
         max_k: maximum draft tokens allowed
@@ -205,11 +228,18 @@ def compute_optimal_k(
     """
     bs, n_cand = score_list.shape
 
-    # Calibrate scores to acceptance probabilities
-    probs = calibration.predict(score_list)
+    # Step 1: Convert cumulative scores to per-position scores
+    per_pos_scores = score_list.clone()
+    per_pos_scores[:, 1:] = score_list[:, 1:] - score_list[:, :-1]
 
-    # Sort globally by probability (descending)
-    flat_probs = probs.flatten()
+    # Step 2: Calibrate per-position scores to acceptance probabilities
+    per_pos_probs = calibration.predict(per_pos_scores)
+
+    # Step 3: Compute cumulative probability via cumprod
+    cum_probs = torch.cumprod(per_pos_probs, dim=1)
+
+    # Sort globally by cumulative probability (descending)
+    flat_probs = cum_probs.flatten()
     sorted_probs, _ = torch.sort(flat_probs, descending=True)
 
     # Cumulative expected accepted tokens
@@ -251,11 +281,15 @@ def find_draft_cutoffs(
     """
     Find optimal global cutoff by sorting all tokens by acceptance probability.
 
-    Sorts all tokens globally, finds the optimal total K that maximizes E/L.
+    Uses per-position scores with cumulative probability computation:
+    1. Convert cumulative scores to per-position scores
+    2. Calibrate per-position scores to acceptance probabilities
+    3. Compute cumulative probability via cumprod
+    4. Sort globally and find optimal total K that maximizes E/L
 
     Args:
         score_list: [bs, n_candidates] cumulative draft scores
-        calibration: maps scores to acceptance probability
+        calibration: maps per-position scores to acceptance probability
         latency_model: piecewise linear latency predictor
         prefill_tokens: tokens from prefill (for mixed batches)
         max_total: maximum total draft tokens
@@ -265,11 +299,18 @@ def find_draft_cutoffs(
     """
     bs, n_cand = score_list.shape
 
-    # Calibrate scores to acceptance probabilities [bs, n_cand]
-    probs = calibration.predict(score_list)
+    # Step 1: Convert cumulative scores to per-position scores
+    per_pos_scores = score_list.clone()
+    per_pos_scores[:, 1:] = score_list[:, 1:] - score_list[:, :-1]
 
-    # Flatten and sort globally by probability (descending)
-    flat_probs = probs.flatten()  # [bs * n_cand]
+    # Step 2: Calibrate per-position scores to acceptance probabilities
+    per_pos_probs = calibration.predict(per_pos_scores)
+
+    # Step 3: Compute cumulative probability via cumprod
+    cum_probs = torch.cumprod(per_pos_probs, dim=1)
+
+    # Flatten and sort globally by cumulative probability (descending)
+    flat_probs = cum_probs.flatten()  # [bs * n_cand]
     sorted_probs, _ = torch.sort(flat_probs, descending=True)
 
     # Cumulative expected accepted tokens
