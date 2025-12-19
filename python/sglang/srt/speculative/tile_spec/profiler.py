@@ -30,8 +30,8 @@ except ImportError:
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
-# Comprehensive batch size sweep for profiling - covers full range 1-64
-WARMUP_BATCH_SIZES = list(range(1, 65))
+# Comprehensive batch size sweep for profiling - covers full range 1-32
+WARMUP_BATCH_SIZES = list(range(1, 33))
 
 # Draft token values to test during profiling
 DRAFT_TOKEN_VALUES = [1, 2, 3, 4]
