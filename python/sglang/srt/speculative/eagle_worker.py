@@ -48,7 +48,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.tile_spec import (
     TileSpecProfiler,
-    compute_optimal_k,
+    find_optimal_cutoff,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -672,13 +672,14 @@ class EAGLEWorker(TpModelWorker):
         if self.enable_tile_spec and self.tile_spec_calibration and self.tile_spec_latency_model:
             # Concatenate scores for optimization
             scores_cat = torch.cat(score_list, dim=1).flatten(1)
-            num_draft_tokens = compute_optimal_k(
+            num_draft_tokens, per_request_k = find_optimal_cutoff(
                 scores_cat,
                 self.tile_spec_calibration,
                 self.tile_spec_latency_model,
                 prefill_tokens=0,  # TODO: pass from batch for mixed batches
                 max_k=self.speculative_num_draft_tokens,
             )
+            # TODO: use per_request_k for variable-length draft selection
         else:
             num_draft_tokens = self.speculative_num_draft_tokens
 

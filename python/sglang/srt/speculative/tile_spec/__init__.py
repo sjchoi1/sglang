@@ -8,8 +8,7 @@ and acceptance probability to maximize throughput.
 from sglang.srt.speculative.tile_spec.core import (
     Calibration,
     PiecewiseLinearLatency,
-    compute_optimal_k,
-    find_draft_cutoffs,
+    find_optimal_cutoff,
 )
 from sglang.srt.speculative.tile_spec.profiler import (
     TileSpecProfiler,
@@ -20,8 +19,7 @@ from sglang.srt.speculative.tile_spec.profiler import (
 __all__ = [
     "Calibration",
     "PiecewiseLinearLatency",
-    "compute_optimal_k",
-    "find_draft_cutoffs",
+    "find_optimal_cutoff",
     "TileSpecProfiler",
     "get_cache_dir",
     "tile_spec_warmup",
