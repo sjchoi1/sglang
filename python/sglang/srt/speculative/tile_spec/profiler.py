@@ -30,9 +30,9 @@ except ImportError:
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
-# Comprehensive batch size sweep for profiling - covers full range 1-128
-# With K values 1-8, this explores all token counts from 1 to ~1024
-WARMUP_BATCH_SIZES = list(range(1, 129))
+# Comprehensive batch size sweep for profiling - covers full range 1-64
+# With K values 1-8, this explores all token counts from 1 to ~512
+WARMUP_BATCH_SIZES = list(range(1, 65))
 
 # Store original log levels for restoration
 _original_log_levels = {}
@@ -199,16 +199,25 @@ def tile_spec_warmup(
     logger.info(f"TileSpec: Completed {total_runs} warmup runs")
 
     # Wait for profiling to complete (auto-finishes when enough samples)
+    logger.info("TileSpec: Waiting for profiling to finish...")
     start_wait = time.time()
+    max_wait = 120  # Maximum 2 minutes wait
+
     while True:
+        wait_duration = time.time() - start_wait
+        if wait_duration > max_wait:
+            logger.warning(f"TileSpec: Profiling did not complete after {max_wait}s, giving up")
+            return
+
         try:
             is_ready = check_ready_fn()
+            logger.info(f"TileSpec: check_ready_fn() = {is_ready} (waited {wait_duration:.1f}s)")
             if is_ready:
-                wait_duration = time.time() - start_wait
                 logger.info(f"TileSpec: Profiling complete (waited {wait_duration:.1f}s)")
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"TileSpec: check_ready_fn() failed: {e}")
+
         time.sleep(1.0)
 
 
