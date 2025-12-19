@@ -672,13 +672,18 @@ class EAGLEWorker(TpModelWorker):
         if self.enable_tile_spec and self.tile_spec_calibration and self.tile_spec_latency_model:
             # Concatenate scores for optimization
             scores_cat = torch.cat(score_list, dim=1).flatten(1)
-            num_draft_tokens, per_request_draft_tokens = find_optimal_cutoff(
+            bs = scores_cat.shape[0]
+            total_draft_tokens, _ = find_optimal_cutoff(
                 scores_cat,
                 self.tile_spec_calibration,
                 self.tile_spec_latency_model,
                 prefill_tokens=0,  # TODO: pass from batch for mixed batches
             )
-            # TODO: use per_request_draft_tokens for variable-length draft selection
+            # Convert total to per-request count (ceiling division)
+            # This respects tile boundaries while keeping uniform k for tree building
+            num_draft_tokens = (total_draft_tokens + bs - 1) // bs
+            # Clamp to valid range: at least 2 (1 verified + 1 draft), at most configured max
+            num_draft_tokens = max(2, min(num_draft_tokens, self.speculative_num_draft_tokens))
         else:
             num_draft_tokens = self.speculative_num_draft_tokens
 
