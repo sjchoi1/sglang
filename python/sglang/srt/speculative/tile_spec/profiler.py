@@ -202,6 +202,14 @@ def tile_spec_warmup(
     finish_flag = Path("/tmp/.sglang_tile_spec_finish")
     finish_flag.touch()
 
+    # Send one more request to trigger the finish signal processing
+    # (record() only runs during verify() calls)
+    logger.info("TileSpec: Triggering finish signal processing...")
+    try:
+        generate_fn([prompts[0]])
+    except Exception as e:
+        logger.warning(f"TileSpec: Final trigger request failed: {e}")
+
     # Wait for profiling to complete
     logger.info("TileSpec: Waiting for profiling to finish...")
     start_wait = time.time()
