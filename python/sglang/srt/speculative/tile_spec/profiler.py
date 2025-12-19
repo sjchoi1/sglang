@@ -31,8 +31,10 @@ except ImportError:
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 # Comprehensive batch size sweep for profiling - covers full range 1-64
-# With K values 1-8, this explores all token counts from 1 to ~512
 WARMUP_BATCH_SIZES = list(range(1, 65))
+
+# Draft token values to test during profiling
+DRAFT_TOKEN_VALUES = [1, 2, 3, 4]
 
 # Store original log levels for restoration
 _original_log_levels = {}
@@ -148,9 +150,9 @@ def tile_spec_warmup(
     logger.info(f"  Batch sizes: 1 to {len(WARMUP_BATCH_SIZES)} (full sweep)")
 
     # Determine draft token counts to test
-    draft_values = list(range(1, 9)) if set_draft_fn is not None else [None]
+    draft_values = DRAFT_TOKEN_VALUES if set_draft_fn is not None else [None]
     if len(draft_values) > 1:
-        logger.info(f"  Draft tokens: {draft_values} (comprehensive draft sweep)")
+        logger.info(f"  Draft tokens: {draft_values}")
     total_configs = len(WARMUP_BATCH_SIZES) * len(draft_values)
     logger.info(f"  Total configurations: {total_configs}")
 
