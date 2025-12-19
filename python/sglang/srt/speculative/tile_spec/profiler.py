@@ -198,7 +198,12 @@ def tile_spec_warmup(
 
     logger.info(f"TileSpec: Completed {total_runs} warmup runs")
 
-    # Wait for profiling to complete (auto-finishes when enough samples)
+    # Signal profiling to finish via flag file (file-based IPC)
+    logger.info("TileSpec: Signaling profiling to finish...")
+    finish_flag = Path("/tmp/.sglang_tile_spec_finish")
+    finish_flag.touch()
+
+    # Wait for profiling to complete
     logger.info("TileSpec: Waiting for profiling to finish...")
     start_wait = time.time()
     max_wait = 120  # Maximum 2 minutes wait
@@ -292,10 +297,11 @@ class TileSpecProfiler:
             for s, a in zip(scores_np, accepted_np):
                 self._calibration_data.append((float(s), bool(a)))
 
-        # Auto-finish after collecting samples from all warmup batches
-        # With 64 batch sizes, we expect ~64 samples. Finish at 60 to ensure coverage.
-        if len(self._latency_data) >= 60:
-            logger.info(f"TileSpec: Auto-finishing profiling ({len(self._latency_data)} samples collected)")
+        # Check for finish signal from warmup (file-based IPC)
+        finish_flag = Path("/tmp/.sglang_tile_spec_finish")
+        if finish_flag.exists():
+            logger.info(f"TileSpec: Finish signal received ({len(self._latency_data)} samples collected)")
+            finish_flag.unlink()  # Clean up flag
             self.finish_profiling()
 
     def finish_profiling(self):
