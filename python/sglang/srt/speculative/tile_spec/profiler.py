@@ -454,17 +454,7 @@ class TileSpecProfiler:
         for n, lat in by_tokens_clean.items():
             all_tokens.extend([n] * len(lat))
             all_lats.extend(lat)
-        ax.scatter(all_tokens, all_lats, alpha=0.4, s=20, label='Clean samples', color='blue')
-
-        # Plot outliers if any
-        outlier_tokens = []
-        outlier_lats = []
-        for n, lat in outliers.items():
-            outlier_tokens.extend([n] * len(lat))
-            outlier_lats.extend(lat)
-        if outlier_tokens:
-            ax.scatter(outlier_tokens, outlier_lats, alpha=0.6, s=30, label='Outliers (removed)',
-                      color='red', marker='x')
+        ax.scatter(all_tokens, all_lats, alpha=0.3, s=20, label='Raw samples')
 
         # Plot aggregated medians
         ax.plot(token_counts, latencies, 'o-', linewidth=2, markersize=8, label='Median latency')
