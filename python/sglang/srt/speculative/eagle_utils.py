@@ -38,6 +38,95 @@ def organize_draft_results(
     return parent_list, top_scores_index, draft_tokens
 
 
+def organize_draft_results_variable_k(
+    score_list: List[torch.Tensor],
+    token_list: List[torch.Tensor],
+    parents_list: List[torch.Tensor],
+    total_k: int,
+    calibration=None,
+):
+    """
+    Organize draft results using global selection by acceptance probability.
+
+    Selects top total_k tokens globally across all requests, sorted by
+    calibrated acceptance probability.
+
+    Args:
+        score_list: list of score tensors from draft steps
+        token_list: list of token tensors from draft steps
+        parents_list: list of parent tensors for tree structure
+        total_k: total number of draft tokens to select globally
+        calibration: optional Calibration to convert scores to probs
+
+    Returns:
+        parent_list: parent indices for tree
+        top_scores_index: [bs, max_k_per_req] selected token indices (padded, sorted)
+        draft_tokens: [bs, max_k_per_req] selected tokens (padded)
+        k_per_request: [bs] count of selected tokens per request
+    """
+    scores = torch.cat(score_list, dim=1).flatten(1)  # [bs, n_candidates]
+    tokens = torch.cat(token_list, dim=1)  # [bs, n_candidates]
+    bs, n_cand = scores.shape
+    device = scores.device
+
+    # Use calibrated probs if available, else raw scores
+    if calibration is not None:
+        probs = calibration.predict(scores)  # [bs, n_cand]
+    else:
+        probs = scores
+
+    # Flatten and sort globally by probability
+    flat_probs = probs.flatten()  # [bs * n_cand]
+    _, sorted_indices = torch.sort(flat_probs, descending=True)
+
+    # Select top total_k globally (minus bs for verified tokens)
+    num_select = min(total_k - bs, bs * n_cand)
+    num_select = max(0, num_select)
+    selected_flat = sorted_indices[:num_select]
+
+    # Convert flat indices to (request_id, token_idx)
+    request_ids = selected_flat // n_cand
+    token_indices = selected_flat % n_cand
+
+    # Count per request
+    k_per_request = torch.zeros(bs, dtype=torch.long, device=device)
+    for i in range(bs):
+        k_per_request[i] = (request_ids == i).sum()
+
+    max_k_per_req = k_per_request.max().item() if k_per_request.numel() > 0 else 1
+    max_k_per_req = max(1, max_k_per_req)
+
+    # Build per-request selected indices (padded)
+    top_scores_index = torch.zeros(bs, max_k_per_req, dtype=torch.long, device=device)
+    draft_tokens = torch.zeros(bs, max_k_per_req, dtype=tokens.dtype, device=device)
+
+    # Fill per-request tensors
+    counts = torch.zeros(bs, dtype=torch.long, device=device)
+    for i in range(num_select):
+        req = request_ids[i].item()
+        tok_idx = token_indices[i].item()
+        pos = counts[req].item()
+        if pos < max_k_per_req:
+            top_scores_index[req, pos] = tok_idx
+            draft_tokens[req, pos] = tokens[req, tok_idx]
+            counts[req] += 1
+
+    # Sort indices within each request for tree building
+    for i in range(bs):
+        k = k_per_request[i].item()
+        if k > 0:
+            sorted_idx = torch.sort(top_scores_index[i, :k]).values
+            top_scores_index[i, :k] = sorted_idx
+            draft_tokens[i, :k] = tokens[i, sorted_idx]
+
+    if len(parents_list) > 1:
+        parent_list = torch.cat(parents_list[:-1], dim=1)
+    else:
+        parent_list = torch.empty(bs, 0, device=device)
+
+    return parent_list, top_scores_index, draft_tokens, k_per_request
+
+
 class TreeMaskMode(IntEnum):
     FULL_MASK = 0
     QLEN_ONLY = 1

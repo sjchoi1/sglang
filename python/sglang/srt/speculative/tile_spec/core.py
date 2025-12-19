@@ -239,3 +239,63 @@ def compute_optimal_k(
                 best_k = k
 
     return max(8, best_k)
+
+
+def find_draft_cutoffs(
+    score_list: torch.Tensor,
+    calibration: Calibration,
+    latency_model: PiecewiseLinearLatency,
+    prefill_tokens: int = 0,
+    max_total: int = 256,
+) -> int:
+    """
+    Find optimal global cutoff by sorting all tokens by acceptance probability.
+
+    Sorts all tokens globally, finds the optimal total K that maximizes E/L.
+
+    Args:
+        score_list: [bs, n_candidates] cumulative draft scores
+        calibration: maps scores to acceptance probability
+        latency_model: piecewise linear latency predictor
+        prefill_tokens: tokens from prefill (for mixed batches)
+        max_total: maximum total draft tokens
+
+    Returns:
+        total_k: optimal total budget
+    """
+    bs, n_cand = score_list.shape
+
+    # Calibrate scores to acceptance probabilities [bs, n_cand]
+    probs = calibration.predict(score_list)
+
+    # Flatten and sort globally by probability (descending)
+    flat_probs = probs.flatten()  # [bs * n_cand]
+    sorted_probs, _ = torch.sort(flat_probs, descending=True)
+
+    # Cumulative expected accepted tokens
+    cum_E = torch.cumsum(sorted_probs, dim=0)
+
+    # Search over optimal k candidates (tile boundaries)
+    candidates = latency_model.get_optimal_k_candidates()
+    max_tokens = min(max_total, len(sorted_probs))
+
+    best_total_k = min(candidates[0], max_tokens) if candidates else 32
+    best_ratio = 0.0
+
+    for k in candidates:
+        if k <= 0 or k > max_tokens:
+            continue
+
+        # E = expected accepted drafts + bonus tokens (1 per request)
+        E_total = cum_E[k - 1].item() + bs
+
+        # Latency for total tokens
+        L = latency_model.predict(prefill_tokens + k)
+
+        if L > 0:
+            ratio = E_total / L
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_total_k = k
+
+    return max(bs, best_total_k)  # at least 1 per request
