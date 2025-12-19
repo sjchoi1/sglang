@@ -48,18 +48,17 @@ def organize_draft_results_variable_k(
     """
     Organize draft results using global selection by acceptance probability.
 
-    Uses per-position scores with cumulative probability computation:
-    1. Convert cumulative scores to per-position scores
-    2. Calibrate per-position scores to acceptance probabilities
-    3. Compute cumulative probability via cumprod
-    4. Select top total_k tokens globally, sorted by cumulative probability
+    Uses cumulative scores directly:
+    1. Calibrate cumulative scores to acceptance probabilities
+    2. Enforce monotonicity (P_cum[i] <= P_cum[i-1])
+    3. Select top total_k tokens globally, sorted by cumulative probability
 
     Args:
         score_list: list of score tensors from draft steps (cumulative scores)
         token_list: list of token tensors from draft steps
         parents_list: list of parent tensors for tree structure
         total_k: total number of draft tokens to select globally
-        calibration: optional Calibration to convert per-position scores to probs
+        calibration: optional Calibration to convert cumulative scores to probs
 
     Returns:
         parent_list: parent indices for tree
@@ -72,17 +71,10 @@ def organize_draft_results_variable_k(
     bs, n_cand = scores.shape
     device = scores.device
 
-    # Use calibrated probs with cumprod if available, else raw scores
+    # Use calibrated probs if available, else raw scores
     if calibration is not None:
-        # Step 1: Convert cumulative scores to per-position scores
-        per_pos_scores = scores.clone()
-        per_pos_scores[:, 1:] = scores[:, 1:] - scores[:, :-1]
-
-        # Step 2: Calibrate per-position scores to acceptance probabilities
-        per_pos_probs = calibration.predict(per_pos_scores)
-
-        # Step 3: Compute cumulative probability via cumprod
-        probs = torch.cumprod(per_pos_probs, dim=1)
+        # Calibrate cumulative scores to acceptance probabilities
+        probs = calibration.predict(scores)
     else:
         probs = scores
 

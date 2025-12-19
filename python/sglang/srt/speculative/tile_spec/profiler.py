@@ -208,35 +208,6 @@ class TileSpecProfiler:
             if unique >= 4:
                 self.finish_profiling()
 
-    def record_calibration_data(
-        self,
-        num_tokens: int,
-        latency_ms: float,
-        scores: List[float],
-        accepted: List[bool],
-    ):
-        """Record latency and per-position calibration data from verify() call.
-
-        Args:
-            num_tokens: total tokens verified
-            latency_ms: verification latency in milliseconds
-            scores: list of per-position scores (only valid positions)
-            accepted: list of acceptance status (only valid positions)
-        """
-        if not self._profiling:
-            return
-        self._latency_data.append((num_tokens, latency_ms))
-
-        # Collect calibration data (score, accepted) pairs
-        for s, a in zip(scores, accepted):
-            self._calibration_data.append((float(s), bool(a)))
-
-        # Auto-finish when enough diverse samples
-        if len(self._latency_data) >= self.min_samples:
-            unique = len(set(t for t, _ in self._latency_data))
-            if unique >= 4:
-                self.finish_profiling()
-
     def finish_profiling(self):
         """Fit latency model from collected data."""
         if not self._profiling:

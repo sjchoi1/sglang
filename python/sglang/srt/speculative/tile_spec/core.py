@@ -1,7 +1,7 @@
 """
 Core tile-aware speculation algorithms.
 
-- Calibration: maps per-position draft scores to acceptance probabilities (linear regression)
+- Calibration: maps cumulative draft scores to acceptance probabilities (linear regression)
 - PiecewiseLinearLatency: models verification latency with tile boundaries
 - compute_optimal_k: finds optimal draft token count maximizing E/Latency
 """
@@ -13,7 +13,7 @@ import torch
 
 
 class Calibration:
-    """Maps per-position draft scores to acceptance probability using linear regression."""
+    """Maps cumulative draft scores to acceptance probability using linear regression."""
 
     def __init__(self):
         # Linear regression: P(accept) = slope * score + intercept
@@ -24,7 +24,7 @@ class Calibration:
         self._device = None
 
     def fit(self, scores: np.ndarray, accepted: np.ndarray):
-        """Fit linear regression from collected (per-position score, accepted) pairs."""
+        """Fit linear regression from collected (cumulative score, accepted) pairs."""
         if len(scores) < 2:
             return
 
@@ -49,7 +49,7 @@ class Calibration:
         self._intercept_tensor = None
 
     def predict(self, scores: torch.Tensor) -> torch.Tensor:
-        """Map per-position scores to acceptance probabilities."""
+        """Map cumulative scores to acceptance probabilities."""
         device = scores.device
 
         # Cache tensors on device
@@ -210,15 +210,13 @@ def compute_optimal_k(
     """
     Find optimal draft token count maximizing E[accepted] / Latency.
 
-    Uses per-position scores with cumulative probability computation:
-    1. Convert cumulative scores to per-position scores
-    2. Calibrate per-position scores to acceptance probabilities
-    3. Compute cumulative probability via cumprod
-    4. Sort globally and find optimal k
+    Uses cumulative scores directly:
+    1. Calibrate cumulative scores to acceptance probabilities
+    2. Sort globally and find optimal k
 
     Args:
         score_list: [bs, n_candidates] cumulative draft scores
-        calibration: maps per-position scores to acceptance probability
+        calibration: maps cumulative scores to acceptance probability
         latency_model: piecewise linear latency predictor
         prefill_tokens: tokens from prefill (for mixed batches)
         max_k: maximum draft tokens allowed
@@ -228,18 +226,11 @@ def compute_optimal_k(
     """
     bs, n_cand = score_list.shape
 
-    # Step 1: Convert cumulative scores to per-position scores
-    per_pos_scores = score_list.clone()
-    per_pos_scores[:, 1:] = score_list[:, 1:] - score_list[:, :-1]
+    # Calibrate cumulative scores to acceptance probabilities
+    probs = calibration.predict(score_list)
 
-    # Step 2: Calibrate per-position scores to acceptance probabilities
-    per_pos_probs = calibration.predict(per_pos_scores)
-
-    # Step 3: Compute cumulative probability via cumprod
-    cum_probs = torch.cumprod(per_pos_probs, dim=1)
-
-    # Sort globally by cumulative probability (descending)
-    flat_probs = cum_probs.flatten()
+    # Sort globally by probability (descending)
+    flat_probs = probs.flatten()
     sorted_probs, _ = torch.sort(flat_probs, descending=True)
 
     # Cumulative expected accepted tokens
@@ -281,15 +272,13 @@ def find_draft_cutoffs(
     """
     Find optimal global cutoff by sorting all tokens by acceptance probability.
 
-    Uses per-position scores with cumulative probability computation:
-    1. Convert cumulative scores to per-position scores
-    2. Calibrate per-position scores to acceptance probabilities
-    3. Compute cumulative probability via cumprod
-    4. Sort globally and find optimal total K that maximizes E/L
+    Uses cumulative scores directly:
+    1. Calibrate cumulative scores to acceptance probabilities
+    2. Sort globally and find optimal total K that maximizes E/L
 
     Args:
         score_list: [bs, n_candidates] cumulative draft scores
-        calibration: maps per-position scores to acceptance probability
+        calibration: maps cumulative scores to acceptance probability
         latency_model: piecewise linear latency predictor
         prefill_tokens: tokens from prefill (for mixed batches)
         max_total: maximum total draft tokens
@@ -299,18 +288,11 @@ def find_draft_cutoffs(
     """
     bs, n_cand = score_list.shape
 
-    # Step 1: Convert cumulative scores to per-position scores
-    per_pos_scores = score_list.clone()
-    per_pos_scores[:, 1:] = score_list[:, 1:] - score_list[:, :-1]
+    # Calibrate cumulative scores to acceptance probabilities
+    probs = calibration.predict(score_list)
 
-    # Step 2: Calibrate per-position scores to acceptance probabilities
-    per_pos_probs = calibration.predict(per_pos_scores)
-
-    # Step 3: Compute cumulative probability via cumprod
-    cum_probs = torch.cumprod(per_pos_probs, dim=1)
-
-    # Flatten and sort globally by cumulative probability (descending)
-    flat_probs = cum_probs.flatten()  # [bs * n_cand]
+    # Flatten and sort globally by probability (descending)
+    flat_probs = probs.flatten()  # [bs * n_cand]
     sorted_probs, _ = torch.sort(flat_probs, descending=True)
 
     # Cumulative expected accepted tokens

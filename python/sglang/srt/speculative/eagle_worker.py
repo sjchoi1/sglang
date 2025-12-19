@@ -682,14 +682,10 @@ class EAGLEWorker(TpModelWorker):
         else:
             num_draft_tokens = self.speculative_num_draft_tokens
 
-        # Store per-position scores for calibration during profiling
+        # Store cumulative scores for calibration during profiling
         if self.enable_tile_spec and self.tile_spec_profiler and self.tile_spec_profiler.is_profiling():
             scores_cat = torch.cat(score_list, dim=1).flatten(1)
-            cumulative_scores = scores_cat[:, :num_draft_tokens]
-            # Convert cumulative scores to per-position scores for calibration
-            per_pos_scores = cumulative_scores.clone()
-            per_pos_scores[:, 1:] = cumulative_scores[:, 1:] - cumulative_scores[:, :-1]
-            self._tile_spec_scores = per_pos_scores
+            self._tile_spec_scores = scores_cat[:, :num_draft_tokens]
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, num_draft_tokens
@@ -796,35 +792,18 @@ class EAGLEWorker(TpModelWorker):
             latency_ms = (time.perf_counter() - _profile_start) * 1000
             num_tokens = spec_info.draft_token_num * len(batch.seq_lens)
 
-            # Build per-position calibration data
-            # Only include positions 0 to accept_length (the first rejection)
-            # Positions after accept_length are unknown (never evaluated)
+            # Build accepted mask for calibration
             scores = self._tile_spec_scores
+            accepted = None
             if scores is not None:
                 bs = len(res.accept_length_per_req_cpu)
                 draft_k = spec_info.draft_token_num
-
-                # Build (score, accepted) pairs only for valid positions
-                valid_scores = []
-                valid_accepted = []
+                accepted = torch.zeros(bs, draft_k, dtype=torch.bool, device=scores.device)
                 for i, acc_len in enumerate(res.accept_length_per_req_cpu):
-                    # Positions 0 to acc_len-1: accepted
-                    for j in range(min(acc_len, draft_k)):
-                        valid_scores.append(scores[i, j].item())
-                        valid_accepted.append(True)
-                    # Position acc_len: rejected (if within draft_k)
-                    if acc_len < draft_k:
-                        valid_scores.append(scores[i, acc_len].item())
-                        valid_accepted.append(False)
-
+                    accepted[i, :acc_len] = True
                 self._tile_spec_scores = None
 
-                # Record with valid data only
-                self.tile_spec_profiler.record_calibration_data(
-                    num_tokens, latency_ms, valid_scores, valid_accepted
-                )
-            else:
-                self.tile_spec_profiler.record(num_tokens, latency_ms, None, None)
+            self.tile_spec_profiler.record(num_tokens, latency_ms, scores, accepted)
 
             # Update worker models after profiling completes
             if self.tile_spec_latency_model is None and self.tile_spec_profiler.latency_model is not None:
