@@ -89,7 +89,7 @@ class PiecewiseLinearLatency:
         # Cached tensors for vectorized predict_batch
         self._latency_cache: torch.Tensor = None
         self._cache_device: torch.device = None
-        self._cache_max_k: int = 0
+        self._cache_size: int = 0
 
     def fit(
         self,
@@ -150,7 +150,7 @@ class PiecewiseLinearLatency:
 
     def predict(self, n: int) -> float:
         """Predict latency for n tokens."""
-        # Check boundary latencies first (fast path for optimal k search)
+        # Check boundary latencies first (fast path)
         if n in self.boundary_latencies:
             return self.boundary_latencies[n]
 
@@ -164,47 +164,34 @@ class PiecewiseLinearLatency:
             return self.slopes[-1] * n + self.intercepts[-1]
         return 1.0  # fallback
 
-    def predict_batch(self, max_k: int, device: torch.device) -> torch.Tensor:
+    def predict_batch(self, max_tokens: int, device: torch.device) -> torch.Tensor:
         """
-        Get latencies for k=1..max_k as a tensor (cached).
+        Get latencies for token counts 1..max_tokens as a tensor (cached).
 
         Returns:
-            latencies: [max_k] tensor where latencies[i] = latency for (i+1) tokens
+            latencies: [max_tokens] tensor where latencies[i] = latency for (i+1) tokens
         """
         # Return cached if available
         if (self._latency_cache is not None and
             self._cache_device == device and
-            self._cache_max_k >= max_k):
-            return self._latency_cache[:max_k]
+            self._cache_size >= max_tokens):
+            return self._latency_cache[:max_tokens]
 
         # Build latency lookup table
-        latencies = torch.empty(max_k, dtype=torch.float32, device=device)
-        for k in range(1, max_k + 1):
-            latencies[k - 1] = self.predict(k)
+        latencies = torch.empty(max_tokens, dtype=torch.float32, device=device)
+        for i in range(1, max_tokens + 1):
+            latencies[i - 1] = self.predict(i)
 
         # Cache for reuse
         self._latency_cache = latencies
         self._cache_device = device
-        self._cache_max_k = max_k
+        self._cache_size = max_tokens
 
         return latencies
 
     def get_boundaries(self) -> List[int]:
         """Return tile boundaries (segment start points)."""
         return self.boundaries[:-1]
-
-    def get_optimal_k_candidates(self) -> List[int]:
-        """
-        Return optimal k values for searching.
-
-        These are the END of each segment minus 1, which gives
-        maximum tokens before the next latency jump.
-
-        Example: boundaries = [1, 65, 129, 193, 257, 385, 513]
-        Returns: [64, 128, 192, 256, 384, 512]
-        """
-        candidates = [b - 1 for b in self.boundaries[1:]]
-        return candidates
 
     def save(self, path: str):
         np.savez(
@@ -234,7 +221,6 @@ def find_optimal_cutoff(
     calibration: Calibration,
     latency_model: PiecewiseLinearLatency,
     prefill_tokens: int = 0,
-    max_k: int = 256,
 ) -> Tuple[int, torch.Tensor]:
     """
     Find optimal draft token cutoff maximizing E[accepted] / Latency.
@@ -242,7 +228,7 @@ def find_optimal_cutoff(
     Fully vectorized implementation:
     1. Calibrate cumulative scores to acceptance probabilities
     2. Sort globally by probability
-    3. Compute E/L ratio for all k values in parallel
+    3. Compute E/L ratio for all values in parallel
     4. Find argmax and compute per-request allocation
 
     Args:
@@ -250,14 +236,14 @@ def find_optimal_cutoff(
         calibration: maps cumulative scores to acceptance probability
         latency_model: piecewise linear latency predictor
         prefill_tokens: tokens from prefill (for mixed batches)
-        max_k: maximum draft tokens allowed
 
     Returns:
-        total_k: optimal total draft tokens for the batch
-        per_request_k: [bs] number of draft tokens per request
+        total_draft_tokens: optimal total draft tokens for the batch
+        per_request_draft_tokens: [bs] number of draft tokens per request
     """
     bs, n_cand = scores.shape
     device = scores.device
+    max_tokens = bs * n_cand
 
     # 1. Calibrate cumulative scores to acceptance probabilities (vectorized)
     probs = calibration.predict(scores)  # [bs, n_cand]
@@ -267,28 +253,26 @@ def find_optimal_cutoff(
     sorted_probs, sorted_indices = torch.sort(flat_probs, descending=True)
 
     # 3. Compute cumulative expected value (vectorized)
-    max_tokens = min(max_k, len(flat_probs))
-    cum_E = torch.cumsum(sorted_probs[:max_tokens], dim=0)  # [max_tokens]
+    cum_E = torch.cumsum(sorted_probs, dim=0)  # [max_tokens]
 
-    # 4. Get latencies for all k values (cached tensor)
-    latencies = latency_model.predict_batch(max_tokens, device)  # [max_tokens]
+    # 4. Get latencies for all token counts (cached tensor, single call)
     if prefill_tokens > 0:
-        # Shift latencies for prefill offset
-        k_vals = torch.arange(1, max_tokens + 1, device=device)
         latencies = latency_model.predict_batch(prefill_tokens + max_tokens, device)
         latencies = latencies[prefill_tokens:prefill_tokens + max_tokens]
+    else:
+        latencies = latency_model.predict_batch(max_tokens, device)
 
-    # 5. Compute E/L ratio for all k (vectorized) - add bs bonus tokens
+    # 5. Compute E/L ratio for all counts (vectorized) - add bs bonus tokens
     ratios = (cum_E + bs) / latencies  # [max_tokens]
 
-    # 6. Find best k (vectorized argmax)
+    # 6. Find best count (vectorized argmax)
     best_idx = ratios.argmax().item()
-    total_k = best_idx + 1  # k is 1-indexed
-    total_k = max(bs, total_k)  # at least 1 per request
+    total_draft_tokens = best_idx + 1  # 1-indexed
+    total_draft_tokens = max(bs, total_draft_tokens)  # at least 1 per request
 
     # 7. Compute per-request allocation (vectorized with bincount)
-    selected_indices = sorted_indices[:total_k]
+    selected_indices = sorted_indices[:total_draft_tokens]
     request_ids = selected_indices // n_cand  # which request each token belongs to
-    per_request_k = torch.bincount(request_ids, minlength=bs)
+    per_request_draft_tokens = torch.bincount(request_ids, minlength=bs)
 
-    return total_k, per_request_k
+    return total_draft_tokens, per_request_draft_tokens

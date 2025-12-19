@@ -668,18 +668,17 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-        # Compute optimal k (tile-spec or fixed)
+        # Compute optimal draft count (tile-spec or fixed)
         if self.enable_tile_spec and self.tile_spec_calibration and self.tile_spec_latency_model:
             # Concatenate scores for optimization
             scores_cat = torch.cat(score_list, dim=1).flatten(1)
-            num_draft_tokens, per_request_k = find_optimal_cutoff(
+            num_draft_tokens, per_request_draft_tokens = find_optimal_cutoff(
                 scores_cat,
                 self.tile_spec_calibration,
                 self.tile_spec_latency_model,
                 prefill_tokens=0,  # TODO: pass from batch for mixed batches
-                max_k=self.speculative_num_draft_tokens,
             )
-            # TODO: use per_request_k for variable-length draft selection
+            # TODO: use per_request_draft_tokens for variable-length draft selection
         else:
             num_draft_tokens = self.speculative_num_draft_tokens
 
