@@ -64,6 +64,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     SessionParams,
+    SetDraftTokensReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -1225,6 +1226,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self.is_pause = False
             await self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
+
+    async def set_draft_tokens(self, obj: SetDraftTokensReqInput):
+        """Set the number of draft tokens for speculative decoding (for profiling)."""
+        await self.send_to_scheduler.send_pyobj(obj)
 
     async def update_weights_from_disk(
         self,

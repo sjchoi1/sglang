@@ -1297,6 +1297,12 @@ class InitWeightsUpdateGroupReqOutput(BaseReq):
 
 
 @dataclass
+class SetDraftTokensReqInput(BaseReq):
+    # The number of draft tokens for speculative decoding
+    draft: int
+
+
+@dataclass
 class DestroyWeightsUpdateGroupReqInput(BaseReq):
     group_name: str = "weight_update_group"
 

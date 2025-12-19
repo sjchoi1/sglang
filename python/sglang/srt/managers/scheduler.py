@@ -104,6 +104,7 @@ from sglang.srt.managers.io_struct import (
     RpcReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
+    SetDraftTokensReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
@@ -626,6 +627,7 @@ class Scheduler(
                 (GetLoadReqInput, self.get_load),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (SetDraftTokensReqInput, self.set_draft_tokens),
             ]
         )
 
@@ -2578,6 +2580,11 @@ class Scheduler(
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         self._engine_paused = False
+
+    def set_draft_tokens(self, recv_req: SetDraftTokensReqInput):
+        """Set the number of draft tokens for speculative decoding (for profiling)."""
+        if hasattr(self, "draft_worker") and self.draft_worker is not None:
+            self.draft_worker.set_num_draft_tokens(recv_req.draft)
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
