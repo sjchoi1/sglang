@@ -123,10 +123,34 @@ Objective: maximize E[accepted_tokens] / Latency(total_tokens)
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| `Calibration` | `tile_spec/core.py` | Maps draft scores → acceptance probability (histogram binning) |
+| `Calibration` | `tile_spec/core.py` | Maps cumulative draft scores → acceptance probability (linear regression) |
 | `PiecewiseLinearLatency` | `tile_spec/core.py` | Models latency with tile boundary detection (15% jump threshold) |
 | `compute_optimal_k()` | `tile_spec/core.py` | Finds optimal k by searching segment endpoints |
 | `TileSpecProfiler` | `tile_spec/profiler.py` | Automatic profiling during warmup, caching |
+
+### TileSpec Algorithm Details
+
+**Score Structure:**
+- SGLang draft scores are **cumulative probabilities** (products of per-position draft probs)
+- Computed in `select_top_k_tokens()`: `expand_scores = scores * topk_p` (multiplication)
+- Scores decrease along the sequence (product of values < 1)
+
+**Calibration:**
+- Linear regression: `P_accept = clamp(slope * cumulative_score + intercept, 0.01, 0.99)`
+- Training data: `(cumulative_score, path_accepted)` pairs from verify() calls
+- `accepted[i, j] = True` if entire path 0..j was accepted for request i
+
+**Optimal K Selection:**
+```python
+# 1. Calibrate cumulative scores to acceptance probabilities
+probs = calibration.predict(score_list)  # [bs, n_candidates]
+
+# 2. Sort globally by probability (descending)
+sorted_probs = torch.sort(probs.flatten(), descending=True)
+
+# 3. For each tile boundary candidate k, compute E[accepted]/Latency
+# 4. Select k with best ratio
+```
 
 ### Configuration
 
@@ -163,7 +187,15 @@ Key speculative decoding kernels in `sgl-kernel/`:
 
 ### Score Handling
 
-EAGLE scores are **cumulative path scores** (log probabilities along draft path). They represent confidence that the entire path up to that token is correct.
+EAGLE scores are **cumulative path scores** (products of probabilities along draft path, NOT log probabilities). They represent confidence that the entire path up to that token is correct.
+
+```python
+# In select_top_k_tokens() - spec_utils.py
+# Step 0: scores = topk_p (raw probabilities)
+# Step 1+: expand_scores = scores * topk_p (cumulative product)
+```
+
+Since scores are products of probabilities (each < 1), they naturally decrease along the sequence.
 
 ## Debugging Tips
 
