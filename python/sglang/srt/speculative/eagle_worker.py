@@ -209,6 +209,12 @@ class EAGLEWorker(TpModelWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
+    def set_num_draft_tokens(self, draft: int):
+        """Dynamically set the number of draft tokens (for profiling)."""
+        self.speculative_num_draft_tokens = draft
+        self.server_args.speculative_num_draft_tokens = draft
+        logger.info(f"EagleWorker: Set speculative_num_draft_tokens to {draft}")
+
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
         draft_backend_factory = DraftBackendFactory(

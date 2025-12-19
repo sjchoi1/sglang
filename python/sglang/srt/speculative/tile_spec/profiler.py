@@ -82,7 +82,7 @@ def tile_spec_warmup(
     server_args,
     generate_fn: Callable[[List[str]], None],
     check_ready_fn: Callable[[], bool],
-    max_wait: int = 60,
+    set_draft_fn: Optional[Callable[[int], None]] = None,
 ):
     """
     Run TileSpec warmup profiling through actual verify() path.
@@ -91,7 +91,7 @@ def tile_spec_warmup(
         server_args: Server args with model_path and tp_size
         generate_fn: Function to send generation requests, signature: (prompts: List[str]) -> None
         check_ready_fn: Function that returns True when profiling is complete
-        max_wait: Maximum seconds to wait for profiling to complete
+        set_draft_fn: Optional function to set the draft token count, signature: (draft: int) -> None
     """
     logger.info(f"TileSpec: warmup called, tile_spec={getattr(server_args, 'tile_spec', False)}")
     if not getattr(server_args, 'tile_spec', False):
@@ -112,43 +112,62 @@ def tile_spec_warmup(
 
     logger.info("TileSpec: Running warmup profiling...")
     logger.info(f"  Batch sizes: 1 to {len(WARMUP_BATCH_SIZES)} (full sweep)")
-    logger.info(f"  Running single iteration per batch size for comprehensive coverage")
+
+    # Determine draft token counts to test
+    draft_values = list(range(1, 9)) if set_draft_fn is not None else [None]
+    if len(draft_values) > 1:
+        logger.info(f"  Draft tokens: {draft_values} (comprehensive draft sweep)")
+    logger.info(f"  Total configurations: {len(WARMUP_BATCH_SIZES)} batch sizes × {len(draft_values)} draft values")
 
     # Load prompts from shared cache
     prompts = _load_prompts(limit=200)
 
-    # Run warmup with varying batch sizes (single iteration for each size)
+    # Run warmup with varying batch sizes and draft token counts
     idx = 0
     total_runs = 0
 
-    for batch_size in WARMUP_BATCH_SIZES:
-        batch = prompts[idx:idx + batch_size]
-        idx = (idx + batch_size) % len(prompts)  # Wrap around if needed
-        if not batch:
-            break
-        try:
-            generate_fn(batch)
-            total_runs += 1
-            if batch_size % 16 == 0 or batch_size <= 10:  # Log less frequently
-                logger.info(f"TileSpec: Warmup bs={batch_size} done (total: {total_runs})")
-        except Exception as e:
-            logger.warning(f"TileSpec: Warmup batch failed: {e}")
+    for draft_value in draft_values:
+        # Set draft token count if callback provided
+        if set_draft_fn is not None and draft_value is not None:
+            try:
+                set_draft_fn(draft_value)
+                logger.info(f"TileSpec: Set draft={draft_value}")
+            except Exception as e:
+                logger.warning(f"TileSpec: Failed to set draft={draft_value}: {e}")
+                continue
+
+        for batch_size in WARMUP_BATCH_SIZES:
+            batch = prompts[idx:idx + batch_size]
+            idx = (idx + batch_size) % len(prompts)  # Wrap around if needed
+            if not batch:
+                break
+            try:
+                generate_fn(batch)
+                total_runs += 1
+                # Log periodically (every 64 runs or at draft transitions)
+                if total_runs % 64 == 0 or (batch_size == WARMUP_BATCH_SIZES[0] and draft_value is not None):
+                    draft_info = f" draft={draft_value}" if draft_value is not None else ""
+                    logger.info(f"TileSpec: Warmup bs={batch_size}{draft_info} done (total: {total_runs})")
+            except Exception as e:
+                logger.warning(f"TileSpec: Warmup batch failed: {e}")
 
     logger.info(f"TileSpec: Completed {total_runs} warmup runs")
 
     # Wait for profiling to complete (auto-finishes when enough samples)
-    logger.info(f"TileSpec: Waiting for profiling to complete (max {max_wait}s)...")
-    for i in range(max_wait):
+    logger.info("TileSpec: Waiting for profiling to complete...")
+    wait_time = 0
+    while True:
         try:
             is_ready = check_ready_fn()
             if is_ready:
-                logger.info(f"TileSpec: Profiling complete (checked after {i+1}s)")
+                logger.info(f"TileSpec: Profiling complete (waited {wait_time}s)")
                 return
         except Exception as e:
             logger.warning(f"TileSpec: check_ready_fn() failed in loop: {e}")
         time.sleep(1.0)
-
-    logger.warning("TileSpec: Profiling timeout, continuing anyway")
+        wait_time += 1
+        if wait_time % 10 == 0:
+            logger.info(f"TileSpec: Still waiting... ({wait_time}s elapsed)")
 
 
 class TileSpecProfiler:
@@ -292,6 +311,7 @@ class TileSpecProfiler:
         # 2. Calibration Plot
         if self._calibration_data:
             self._plot_calibration(plots_dir)
+            self._plot_calibration_accuracy(plots_dir)
 
         # 3. Token Distribution Plot
         self._plot_token_distribution(by_tokens, plots_dir)
@@ -378,6 +398,76 @@ class TileSpecProfiler:
 
         plt.tight_layout()
         plt.savefig(plots_dir / 'calibration.png', dpi=150)
+        plt.close()
+
+    def _plot_calibration_accuracy(self, plots_dir):
+        """Plot calibration accuracy: predicted P(accept) vs actual P(accept)."""
+        import matplotlib.pyplot as plt
+
+        if not self.calibration:
+            return
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        # Get scores and actual acceptance
+        cal_scores = np.array([s for s, _ in self._calibration_data])
+        cal_accepted = np.array([a for _, a in self._calibration_data])
+
+        # Get predicted probabilities from fitted model
+        score_tensor = torch.tensor(cal_scores, dtype=torch.float32)
+        predicted_probs = self.calibration.predict(score_tensor).cpu().numpy()
+
+        # Bin predicted probabilities and compute actual acceptance rate
+        n_bins = 20
+        bins = np.linspace(0, 1, n_bins + 1)
+        bin_indices = np.digitize(predicted_probs, bins)
+
+        bin_predicted = []
+        bin_actual = []
+        bin_counts = []
+        for i in range(1, len(bins)):
+            mask = bin_indices == i
+            if mask.sum() >= 5:  # At least 5 samples per bin
+                bin_predicted.append((bins[i-1] + bins[i]) / 2)
+                bin_actual.append(cal_accepted[mask].mean())
+                bin_counts.append(mask.sum())
+
+        # Plot calibration accuracy with point size showing sample count
+        if bin_predicted:
+            sizes = [min(c / 5, 200) for c in bin_counts]  # Scale sizes
+            ax.scatter(bin_predicted, bin_actual, s=sizes, alpha=0.6, label='Binned data')
+
+        # Plot perfect calibration line
+        ax.plot([0, 1], [0, 1], 'r--', linewidth=2, label='Perfect calibration')
+
+        # Calculate calibration metrics
+        if bin_predicted:
+            bin_predicted_arr = np.array(bin_predicted)
+            bin_actual_arr = np.array(bin_actual)
+            bin_counts_arr = np.array(bin_counts)
+
+            # Mean Absolute Error
+            mae = np.mean(np.abs(bin_predicted_arr - bin_actual_arr))
+
+            # Expected Calibration Error (ECE) - weighted by sample count
+            ece = np.sum(bin_counts_arr * np.abs(bin_predicted_arr - bin_actual_arr)) / np.sum(bin_counts_arr)
+
+            # Display metrics
+            metrics_text = f'MAE: {mae:.4f}\nECE: {ece:.4f}'
+            ax.text(0.05, 0.95, metrics_text,
+                   transform=ax.transAxes, fontsize=11,
+                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+        ax.set_xlabel('Predicted P(Accept)', fontsize=12)
+        ax.set_ylabel('Actual P(Accept)', fontsize=12)
+        ax.set_title('Calibration Accuracy', fontsize=14, fontweight='bold')
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(-0.05, 1.05)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'calibration_accuracy.png', dpi=150)
         plt.close()
 
     def _plot_token_distribution(self, by_tokens, plots_dir):
