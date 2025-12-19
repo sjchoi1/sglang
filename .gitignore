@@ -253,3 +253,6 @@ outputs/
 # Eval Cache
 .longbench_cache/
 Spec-Bench/
+
+# TileSpec cache (large profiling data)
+tile_spec/cache/
