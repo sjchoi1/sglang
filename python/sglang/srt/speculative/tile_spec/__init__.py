@@ -13,6 +13,7 @@ from sglang.srt.speculative.tile_spec.core import (
 from sglang.srt.speculative.tile_spec.profiler import (
     TileSpecProfiler,
     get_cache_dir,
+    tile_spec_warmup,
 )
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     "compute_optimal_k",
     "TileSpecProfiler",
     "get_cache_dir",
+    "tile_spec_warmup",
 ]

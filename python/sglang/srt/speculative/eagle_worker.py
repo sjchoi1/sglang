@@ -111,6 +111,7 @@ class EAGLEWorker(TpModelWorker):
         self.tile_spec_profiler = None
         self.calibration = None
         self.latency_model = None
+        self._profiling_scores = None
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -681,6 +682,11 @@ class EAGLEWorker(TpModelWorker):
         else:
             num_draft_tokens = self.speculative_num_draft_tokens
 
+        # Store scores for calibration during profiling
+        if self.enable_tile_spec and self.tile_spec_profiler and self.tile_spec_profiler.is_profiling():
+            scores_cat = torch.cat(score_list, dim=1).flatten(1)
+            self._profiling_scores = scores_cat[:, :num_draft_tokens]
+
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, num_draft_tokens
         )
@@ -714,6 +720,12 @@ class EAGLEWorker(TpModelWorker):
             draft_tokens_cpu = spec_info.draft_token.view(
                 spec_info.retrive_next_token.shape
             ).cpu()
+
+        # Tile-spec profiling: measure verification latency
+        _profile_start = None
+        if self.enable_tile_spec and self.tile_spec_profiler and self.tile_spec_profiler.is_profiling():
+            torch.cuda.synchronize()
+            _profile_start = time.perf_counter()
 
         # Forward
         batch_result = self.target_worker.forward_batch_generation(
@@ -773,6 +785,29 @@ class EAGLEWorker(TpModelWorker):
 
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
+
+        # Tile-spec profiling: record latency and calibration data
+        if _profile_start is not None:
+            torch.cuda.synchronize()
+            latency_ms = (time.perf_counter() - _profile_start) * 1000
+            num_tokens = spec_info.draft_token_num * len(batch.seq_lens)
+
+            # Build accepted mask for calibration
+            scores = self._profiling_scores
+            accepted = None
+            if scores is not None:
+                bs = len(res.accept_length_per_req_cpu)
+                draft_k = spec_info.draft_token_num
+                accepted = torch.zeros(bs, draft_k, dtype=torch.bool, device=scores.device)
+                for i, acc_len in enumerate(res.accept_length_per_req_cpu):
+                    accepted[i, :acc_len] = True
+                self._profiling_scores = None
+
+            self.tile_spec_profiler.record(num_tokens, latency_ms, scores, accepted)
+
+            # Update worker models after profiling completes
+            if self.latency_model is None and self.tile_spec_profiler.latency_model is not None:
+                self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
@@ -1101,54 +1136,9 @@ class EAGLEWorker(TpModelWorker):
         # Try to load from cache first
         self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
 
-        if self.latency_model:
-            logger.info(f"TileSpec: Loaded from cache, boundaries={self.latency_model.boundaries}")
-        else:
-            # Run offline profiling before accepting requests
-            logger.info("TileSpec: No cache found, running offline profiling...")
-            self._run_offline_profiling()
-            self.latency_model, self.calibration = self.tile_spec_profiler.get_models()
-            logger.info(f"TileSpec: Profiling complete, boundaries={self.latency_model.boundaries}")
-
-    def _run_offline_profiling(self):
-        """Run offline latency profiling with synthetic workloads."""
-        import time
-
-        # Token counts to profile (covers typical tile boundaries)
-        token_counts = [16, 32, 64, 96, 128, 192, 256, 384, 512]
-        samples_per_count = 5
-
-        self.tile_spec_profiler.start_profiling()
-
-        for num_tokens in token_counts:
-            for _ in range(samples_per_count):
-                # Create dummy input matching verify() shape
-                dummy_input = torch.zeros(
-                    num_tokens,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-
-                # Time a forward pass through target model
-                torch.cuda.synchronize()
-                start = time.perf_counter()
-
-                with torch.no_grad():
-                    # Run target model forward (similar to verify path)
-                    self.target_worker.model_runner.model.forward(
-                        input_ids=dummy_input.unsqueeze(0) if dummy_input.dim() == 1 else dummy_input,
-                        positions=torch.arange(num_tokens, device=self.device),
-                        forward_batch=None,
-                    )
-
-                torch.cuda.synchronize()
-                latency_ms = (time.perf_counter() - start) * 1000
-
-                # Record the measurement
-                self.tile_spec_profiler.record(num_tokens, latency_ms)
-
-        # Finish profiling and fit models
-        self.tile_spec_profiler.finish_profiling()
+        if not self.latency_model:
+            # Start profiling - data collected during warmup via verify() calls
+            self.tile_spec_profiler.start_profiling()
 
 
 @torch.compile(dynamic=True, disable=_is_npu)

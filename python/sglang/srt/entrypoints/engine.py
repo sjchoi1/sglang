@@ -261,6 +261,14 @@ class Engine(EngineBase):
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
 
+        # TileSpec warmup (if enabled)
+        from sglang.srt.speculative.tile_spec import tile_spec_warmup
+        tile_spec_warmup(
+            self.server_args,
+            lambda prompts: self.generate(prompts, sampling_params={"temperature": 0.8, "max_new_tokens": 64}),
+            self.tile_spec_ready,
+        )
+
     def generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.

@@ -1,15 +1,18 @@
 """
-Tile-Spec Profiler - Automatic profiling during normal operation.
+Tile-Spec Profiler - Automatic profiling during warmup.
 
 Profiles latency by recording actual verify() calls.
 Cache structure: tile_spec/cache/{model}_{gpu}_{tp}/
 """
 
+import json
 import logging
 import re
+import time
+import urllib.request
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -17,6 +20,9 @@ import torch
 from sglang.srt.speculative.tile_spec.core import Calibration, PiecewiseLinearLatency
 
 logger = logging.getLogger(__name__)
+
+SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+WARMUP_BATCH_SIZES = [1, 4, 16, 64]
 
 
 def get_cache_dir(model_path: str, gpu_name: str, tp_size: int) -> Path:
@@ -32,6 +38,91 @@ def get_cache_dir(model_path: str, gpu_name: str, tp_size: int) -> Path:
             return current / "tile_spec" / "cache" / cache_name
         current = current.parent
     return Path.home() / ".cache" / "sglang" / "tile_spec" / cache_name
+
+
+def _load_prompts(cache_dir: Path, limit: int = 100) -> List[str]:
+    """Load ShareGPT prompts for profiling warmup."""
+    sharegpt_path = cache_dir / "sharegpt.json"
+
+    if not sharegpt_path.exists():
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            logger.info("TileSpec: Downloading ShareGPT dataset...")
+            urllib.request.urlretrieve(SHAREGPT_URL, sharegpt_path)
+        except Exception as e:
+            logger.warning(f"TileSpec: ShareGPT download failed: {e}")
+            return [f"Write a detailed story about topic number {i}." for i in range(limit)]
+
+    try:
+        with open(sharegpt_path) as f:
+            data = json.load(f)
+        prompts = []
+        for item in data:
+            for conv in item.get("conversations", []):
+                if conv.get("from") == "human":
+                    text = conv.get("value", "").strip()
+                    if 50 < len(text) < 2000:
+                        prompts.append(text)
+                        if len(prompts) >= limit:
+                            return prompts
+        return prompts or [f"Write a detailed story about topic number {i}." for i in range(limit)]
+    except Exception:
+        return [f"Write a detailed story about topic number {i}." for i in range(limit)]
+
+
+def tile_spec_warmup(
+    server_args,
+    generate_fn: Callable[[List[str]], None],
+    check_ready_fn: Callable[[], bool],
+    max_wait: int = 60,
+):
+    """
+    Run TileSpec warmup profiling through actual verify() path.
+
+    Args:
+        server_args: Server args with model_path and tp_size
+        generate_fn: Function to send generation requests, signature: (prompts: List[str]) -> None
+        check_ready_fn: Function that returns True when profiling is complete
+        max_wait: Maximum seconds to wait for profiling to complete
+    """
+    if not getattr(server_args, 'tile_spec', False):
+        return
+
+    # Check if already profiled (cached)
+    if check_ready_fn():
+        return
+
+    logger.info("TileSpec: Running warmup profiling...")
+
+    # Load prompts
+    cache_dir = get_cache_dir(
+        server_args.model_path,
+        torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        server_args.tp_size,
+    )
+    prompts = _load_prompts(cache_dir, limit=100)
+
+    # Run warmup with varying batch sizes
+    idx = 0
+    for batch_size in WARMUP_BATCH_SIZES:
+        batch = prompts[idx:idx + batch_size]
+        idx += batch_size
+        if not batch:
+            break
+        try:
+            generate_fn(batch)
+            logger.info(f"TileSpec: Warmup batch_size={batch_size} done")
+        except Exception as e:
+            logger.warning(f"TileSpec: Warmup batch failed: {e}")
+
+    # Wait for profiling to complete (auto-finishes when enough samples)
+    for _ in range(max_wait):
+        if check_ready_fn():
+            logger.info("TileSpec: Profiling complete")
+            return
+        time.sleep(1.0)
+
+    logger.warning("TileSpec: Profiling timeout, continuing anyway")
 
 
 class TileSpecProfiler:

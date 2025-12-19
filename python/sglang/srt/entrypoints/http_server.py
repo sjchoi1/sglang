@@ -1615,6 +1615,20 @@ def _execute_server_warmup(
 
     # Debug print
     # logger.info(f"warmup request returns: {res.json()=}")
+
+    # TileSpec warmup (if enabled)
+    from sglang.srt.speculative.tile_spec import tile_spec_warmup
+    tile_spec_warmup(
+        server_args,
+        lambda prompts: requests.post(
+            url + "/generate",
+            json={"text": prompts, "sampling_params": {"temperature": 0.8, "max_new_tokens": 64}},
+            headers=headers,
+            timeout=120,
+        ),
+        lambda: requests.get(url + "/get_server_info", timeout=5, headers=headers).json().get("tile_spec_ready", True),
+    )
+
     return success
 
 
