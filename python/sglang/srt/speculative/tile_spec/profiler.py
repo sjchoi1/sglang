@@ -30,11 +30,8 @@ except ImportError:
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
-# Comprehensive batch size sweep for profiling - covers full range 1-32
-WARMUP_BATCH_SIZES = list(range(1, 33))
-
-# Draft token values to test during profiling
-DRAFT_TOKEN_VALUES = [1, 2, 3, 4]
+# Comprehensive batch size sweep for profiling - covers full range 1-64
+WARMUP_BATCH_SIZES = list(range(1, 65))
 
 # Store original log levels for restoration
 _original_log_levels = {}
@@ -119,16 +116,16 @@ def tile_spec_warmup(
     server_args,
     generate_fn: Callable[[List[str]], None],
     check_ready_fn: Callable[[], bool],
-    set_draft_fn: Optional[Callable[[int], None]] = None,
 ):
     """
     Run TileSpec warmup profiling through actual verify() path.
+
+    Draft token variation is handled internally via random truncation in organize_draft_results().
 
     Args:
         server_args: Server args with model_path and tp_size
         generate_fn: Function to send generation requests, signature: (prompts: List[str]) -> None
         check_ready_fn: Function that returns True when profiling is complete
-        set_draft_fn: Optional function to set the draft token count, signature: (draft: int) -> None
     """
     logger.info(f"TileSpec: warmup called, tile_spec={getattr(server_args, 'tile_spec', False)}")
     if not getattr(server_args, 'tile_spec', False):
@@ -148,13 +145,8 @@ def tile_spec_warmup(
 
     logger.info("TileSpec: Running warmup profiling...")
     logger.info(f"  Batch sizes: 1 to {len(WARMUP_BATCH_SIZES)} (full sweep)")
-
-    # Determine draft token counts to test
-    draft_values = DRAFT_TOKEN_VALUES if set_draft_fn is not None else [None]
-    if len(draft_values) > 1:
-        logger.info(f"  Draft tokens: {draft_values}")
-    total_configs = len(WARMUP_BATCH_SIZES) * len(draft_values)
-    logger.info(f"  Total configurations: {total_configs}")
+    logger.info(f"  Draft tokens: random truncation per request (handled internally)")
+    logger.info(f"  Total configurations: {len(WARMUP_BATCH_SIZES)}")
 
     # Load prompts from shared cache
     prompts = _load_prompts(limit=200)
@@ -163,36 +155,25 @@ def tile_spec_warmup(
     _suppress_profiling_logs()
 
     try:
-        # Run warmup with varying batch sizes and draft token counts
+        # Run warmup with varying batch sizes
+        # Draft token variation is handled internally via random truncation
         idx = 0
         total_runs = 0
 
-        pbar = tqdm(total=total_configs, desc="TileSpec Profiling", unit="run", ncols=80)
+        pbar = tqdm(total=len(WARMUP_BATCH_SIZES), desc="TileSpec Profiling", unit="run", ncols=80)
 
-        for draft_value in draft_values:
-            # Set draft token count if callback provided
-            if set_draft_fn is not None and draft_value is not None:
-                try:
-                    logger.info(f"TileSpec: Setting draft tokens to {draft_value}")
-                    set_draft_fn(draft_value)
-                    pbar.set_postfix({"draft": draft_value})
-                    logger.info(f"TileSpec: Draft tokens set to {draft_value}")
-                except Exception as e:
-                    logger.warning(f"TileSpec: Failed to set draft={draft_value}: {e}")
-                    continue
-
-            for batch_size in WARMUP_BATCH_SIZES:
-                batch = prompts[idx:idx + batch_size]
-                idx = (idx + batch_size) % len(prompts)  # Wrap around if needed
-                if not batch:
-                    break
-                try:
-                    generate_fn(batch)
-                    total_runs += 1
-                    pbar.update(1)
-                except Exception as e:
-                    logger.warning(f"TileSpec: Warmup batch failed: {e}")
-                    pbar.update(1)
+        for batch_size in WARMUP_BATCH_SIZES:
+            batch = prompts[idx:idx + batch_size]
+            idx = (idx + batch_size) % len(prompts)  # Wrap around if needed
+            if not batch:
+                break
+            try:
+                generate_fn(batch)
+                total_runs += 1
+                pbar.update(1)
+            except Exception as e:
+                logger.warning(f"TileSpec: Warmup batch failed: {e}")
+                pbar.update(1)
 
         pbar.close()
     finally:

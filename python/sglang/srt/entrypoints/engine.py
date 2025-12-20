@@ -267,7 +267,6 @@ class Engine(EngineBase):
             self.server_args,
             lambda prompts: self.generate(prompts, sampling_params={"temperature": 0, "max_new_tokens": 64}),
             self.tile_spec_ready,
-            self.set_draft_tokens,
         )
 
     def generate(
@@ -535,15 +534,6 @@ class Engine(EngineBase):
             "internal_states": internal_states,
             "version": __version__,
         }
-
-    def set_draft_tokens(self, draft: int):
-        """Set the number of draft tokens for speculative decoding (for profiling)."""
-        from sglang.srt.managers.io_struct import SetDraftTokensReqInput
-
-        req_input = SetDraftTokensReqInput(draft=draft)
-        self.loop.run_until_complete(
-            self.tokenizer_manager.set_draft_tokens(req_input)
-        )
 
     def tile_spec_ready(self) -> bool:
         """Check if tile-spec profiling is complete.

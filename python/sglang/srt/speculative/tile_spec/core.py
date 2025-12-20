@@ -3,10 +3,9 @@ Core tile-aware speculation algorithms.
 
 - Calibration: maps cumulative draft scores to acceptance probabilities (linear regression)
 - PiecewiseLinearLatency: models verification latency with tile boundaries
-- find_optimal_cutoff: finds optimal draft token count maximizing E[accepted]/Latency
 """
 
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
 import torch
@@ -210,65 +209,3 @@ class PiecewiseLinearLatency:
         bl_values = data.get("boundary_latencies_values", [])
         if len(bl_keys) > 0:
             self.boundary_latencies = {int(k): float(v) for k, v in zip(bl_keys, bl_values)}
-
-
-def find_optimal_cutoff(
-    scores: torch.Tensor,
-    calibration: Calibration,
-    latency_model: PiecewiseLinearLatency,
-    prefill_tokens: int = 0,
-) -> Tuple[int, torch.Tensor]:
-    """
-    Find optimal draft token cutoff maximizing E[accepted] / Latency.
-
-    Fully vectorized implementation:
-    1. Calibrate cumulative scores to acceptance probabilities
-    2. Sort globally by probability
-    3. Compute E/L ratio for all values in parallel
-    4. Find argmax and compute per-request allocation
-
-    Args:
-        scores: [bs, n_candidates] cumulative draft scores
-        calibration: maps cumulative scores to acceptance probability
-        latency_model: piecewise linear latency predictor
-        prefill_tokens: tokens from prefill (for mixed batches)
-
-    Returns:
-        total_draft_tokens: optimal total draft tokens for the batch
-        per_request_draft_tokens: [bs] number of draft tokens per request
-    """
-    bs, n_cand = scores.shape
-    device = scores.device
-    max_tokens = bs * n_cand
-
-    # 1. Calibrate cumulative scores to acceptance probabilities (vectorized)
-    probs = calibration.predict(scores)  # [bs, n_cand]
-
-    # 2. Flatten and sort globally by probability (vectorized)
-    flat_probs = probs.flatten()  # [bs * n_cand]
-    sorted_probs, sorted_indices = torch.sort(flat_probs, descending=True)
-
-    # 3. Compute cumulative expected value (vectorized)
-    cum_E = torch.cumsum(sorted_probs, dim=0)  # [max_tokens]
-
-    # 4. Get latencies for all token counts (cached tensor, single call)
-    if prefill_tokens > 0:
-        latencies = latency_model.predict_batch(prefill_tokens + max_tokens, device)
-        latencies = latencies[prefill_tokens:prefill_tokens + max_tokens]
-    else:
-        latencies = latency_model.predict_batch(max_tokens, device)
-
-    # 5. Compute E/L ratio for all counts (vectorized) - add bs bonus tokens
-    ratios = (cum_E + bs) / latencies  # [max_tokens]
-
-    # 6. Find best count (vectorized argmax)
-    best_idx = ratios.argmax().item()
-    total_draft_tokens = best_idx + 1  # 1-indexed
-    total_draft_tokens = max(bs, total_draft_tokens)  # at least 1 per request
-
-    # 7. Compute per-request allocation (vectorized with bincount)
-    selected_indices = sorted_indices[:total_draft_tokens]
-    request_ids = selected_indices // n_cand  # which request each token belongs to
-    per_request_draft_tokens = torch.bincount(request_ids, minlength=bs)
-
-    return total_draft_tokens, per_request_draft_tokens

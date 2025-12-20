@@ -20,49 +20,116 @@ def organize_draft_results(
     score_list: List[torch.Tensor],
     token_list: List[torch.Tensor],
     parents_list: List[torch.Tensor],
-    num_draft_token,  # Can be int or torch.Tensor[bs]
+    num_draft_token: int,
+    calibration=None,
+    latency_model=None,
+    is_tilespec_profiling: bool = False,
 ):
-    score_list_cat = torch.cat(score_list, dim=1).flatten(1)
-    ss_token_list = torch.cat(token_list, dim=1)
+    """
+    Organize draft results and select tokens for verification.
 
-    # Handle both uniform (int) and per-request (tensor) draft counts
-    if isinstance(num_draft_token, int):
-        # Original uniform logic
-        top_scores = torch.topk(score_list_cat, num_draft_token - 1, dim=-1)
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
-        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
-    else:
-        # Per-request logic: select EXACT number of tokens per request (NO PADDING)
-        # Returns lists of per-request results to be processed separately
-        bs = score_list_cat.shape[0]
-        per_request_k = num_draft_token  # [bs] tensor
+    Args:
+        score_list: List of score tensors from each draft step
+        token_list: List of token tensors from each draft step
+        parents_list: List of parent tensors from each draft step
+        num_draft_token: Maximum draft tokens (always int)
+        calibration: TileSpec Calibration object (optional)
+        latency_model: TileSpec PiecewiseLinearLatency object (optional)
+        is_tilespec_profiling: Whether TileSpec is in profiling mode
 
-        top_scores_index = []
-        draft_tokens = []
+    Returns:
+        parent_list: Parent indices for tree building
+        top_scores_index: Selected token indices (tensor or list)
+        draft_tokens: Selected tokens (tensor or list)
+        per_request_k: Per-request token counts (None if uniform)
+    """
+    scores = torch.cat(score_list, dim=1).flatten(1)
+    tokens = torch.cat(token_list, dim=1)
+    bs, n_cand = scores.shape
+    device = scores.device
 
-        for i in range(bs):
-            k_i = int(per_request_k[i].item()) - 1
-            if k_i > 0:
-                top_scores_i = torch.topk(score_list_cat[i], k_i, dim=-1)
-                indices_i = torch.sort(top_scores_i.indices).values
-                top_scores_index.append(indices_i)
-                draft_tokens.append(ss_token_list[i, indices_i])
+    # Check if TileSpec is active
+    tilespec_active = is_tilespec_profiling or (calibration is not None and latency_model is not None)
+
+    if tilespec_active:
+        # Step 1: Determine draft counts per request
+        if is_tilespec_profiling:
+            # Profiling: random counts in [0, n_cand] per request (reject all to accept all)
+            draft_counts = torch.randint(0, n_cand + 1, (bs,), device=device, dtype=torch.long)
+        else:
+            # Runtime: optimal counts from global E/L optimization
+            probs = calibration.predict(scores)
+            sorted_probs, sorted_indices = torch.sort(probs.flatten(), descending=True)
+            cum_E = torch.cumsum(sorted_probs, dim=0)
+
+            # Get latencies for bs, bs+1, ..., bs+n_cand tokens
+            max_total = bs + len(cum_E)
+            latencies_all = latency_model.predict_batch(max_total, device)
+
+            # For k drafts: total tokens = bs + (k+1), latency = latencies_all[bs + k]
+            latencies = latencies_all[bs:bs + len(cum_E)]
+            expected_throughput = (cum_E + bs) / latencies
+
+            # Consider 0-draft option
+            expected_throughput_zero = bs / latencies_all[bs - 1]  # bs tokens / latency(bs)
+
+            if len(cum_E) == 0 or expected_throughput_zero >= expected_throughput.max():
+                total = 0
             else:
-                # At least return empty tensors for consistency
-                top_scores_index.append(torch.empty(0, dtype=torch.long, device=score_list_cat.device))
-                draft_tokens.append(torch.empty(0, dtype=ss_token_list.dtype, device=score_list_cat.device))
+                best_idx = expected_throughput.argmax().item()
+                total = best_idx + 1
 
-        # Return as lists for per-request processing (will be handled in draft())
-        # Don't concatenate here - let caller build trees per-request
+            # Compute draft counts
+            if total > 0:
+                request_ids = sorted_indices[:total] // n_cand
+                draft_counts = torch.bincount(request_ids, minlength=bs)
+            else:
+                draft_counts = torch.zeros(bs, dtype=torch.long, device=device)
 
+        # Step 2: Unified selection - single topk, vectorized split
+        per_request_k = draft_counts + 1  # +1 for verified token
+        max_drafts = int(draft_counts.max().item())
+
+        if max_drafts > 0:
+            # One topk for all requests
+            top_k_result = torch.topk(scores, max_drafts, dim=-1)
+            top_indices = torch.sort(top_k_result.indices, dim=-1).values  # [bs, max_drafts]
+            top_tokens = torch.gather(tokens, dim=1, index=top_indices)  # [bs, max_drafts]
+
+            # Vectorized slicing
+            total_drafts = int(draft_counts.sum().item())
+            cumsum = draft_counts.cumsum(0)
+            offsets = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
+            expanded_offsets = torch.repeat_interleave(offsets, draft_counts)
+            local_indices = torch.arange(total_drafts, device=device, dtype=torch.long) - expanded_offsets
+            request_indices = torch.repeat_interleave(torch.arange(bs, device=device), draft_counts)
+
+            # Gather from topk results
+            all_indices = top_indices[request_indices, local_indices]
+            all_tokens = top_tokens[request_indices, local_indices]
+
+            # Split into lists
+            sizes = draft_counts.tolist()
+            top_scores_index = list(torch.split(all_indices, sizes))
+            draft_tokens = list(torch.split(all_tokens, sizes))
+        else:
+            top_scores_index = [torch.empty(0, dtype=torch.long, device=device) for _ in range(bs)]
+            draft_tokens = [torch.empty(0, dtype=tokens.dtype, device=device) for _ in range(bs)]
+
+    else:
+        # Original EAGLE: uniform selection
+        top_scores = torch.topk(scores, num_draft_token - 1, dim=-1)
+        top_scores_index = torch.sort(top_scores.indices).values
+        draft_tokens = torch.gather(tokens, index=top_scores_index, dim=1)
+        per_request_k = None
+
+    # Build parent_list
     if len(parents_list) > 1:
         parent_list = torch.cat(parents_list[:-1], dim=1)
     else:
-        batch_size = parents_list[0].shape[0]
-        parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
+        parent_list = torch.empty(bs, 0, device=device)
 
-    return parent_list, top_scores_index, draft_tokens
+    return parent_list, top_scores_index, draft_tokens, per_request_k
 
 
 class TreeMaskMode(IntEnum):
