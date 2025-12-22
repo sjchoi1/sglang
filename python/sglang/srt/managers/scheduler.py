@@ -162,6 +162,7 @@ from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.tile_spec import TileSpecProfiler
 from sglang.srt.tracing.trace import (
     process_tracing_init,
     trace_event_batch,
@@ -541,6 +542,18 @@ class Scheduler(
         )
         self.offload_tags = set()
         self.init_profiler()
+
+        # Init TileSpec profiler
+        if server_args.tile_spec:
+            self.tile_spec_profiler = TileSpecProfiler(server_args)
+            if self.tile_spec_profiler.needs_profiling():
+                self.tile_spec_profiler.start_profiling()
+            # Pass profiler to draft worker for recording during verify()
+            if self.draft_worker is not None:
+                self.draft_worker.tile_spec_profiler = self.tile_spec_profiler
+        else:
+            self.tile_spec_profiler = None
+
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
         self.input_blocker = (
             SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
@@ -2371,6 +2384,12 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
 
+        # TileSpec profiling status
+        if self.tile_spec_profiler is not None:
+            ret["tile_spec_ready"] = not self.tile_spec_profiler.is_profiling()
+        else:
+            ret["tile_spec_ready"] = True  # Not enabled = always ready
+
         # This field is not serializable.
         ret.pop("model_config", None)
 
@@ -2378,6 +2397,14 @@ class Scheduler(
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
+
+        # Check for TileSpec profiling finish signal
+        if server_args_dict.get("finish_tile_spec_profiling", False):
+            if self.tile_spec_profiler is not None and self.tile_spec_profiler.is_profiling():
+                logger.info("TileSpec: Received finish profiling signal")
+                self.tile_spec_profiler.finish_profiling()
+            return SetInternalStateReqOutput(success=True)
+
         args_allow_update = set(
             [
                 "pp_max_micro_batch_size",

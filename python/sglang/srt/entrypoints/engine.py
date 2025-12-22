@@ -267,6 +267,7 @@ class Engine(EngineBase):
             self.server_args,
             lambda prompts: self.generate(prompts, sampling_params={"temperature": 0, "max_new_tokens": 64}),
             self.tile_spec_ready,
+            self.finish_tile_spec_profiling,
         )
 
     def generate(
@@ -559,6 +560,15 @@ class Engine(EngineBase):
                 return False
         logger.info("TileSpec: tile_spec_ready() returning True (all states ready)")
         return True
+
+    def finish_tile_spec_profiling(self):
+        """Signal scheduler to finish TileSpec profiling."""
+        if not getattr(self.server_args, 'tile_spec', False):
+            return
+        logger.info("TileSpec: Signaling scheduler to finish profiling")
+        self.loop.run_until_complete(
+            self.tokenizer_manager.set_internal_state({"finish_tile_spec_profiling": True})
+        )
 
     def init_weights_update_group(
         self,

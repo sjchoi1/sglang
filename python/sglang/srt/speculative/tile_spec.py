@@ -300,13 +300,6 @@ class TileSpecProfiler:
             for s, a in zip(scores_np, accepted_np):
                 self._calibration_data.append((float(s), bool(a)))
 
-        # Check for finish signal from warmup (file-based IPC)
-        finish_flag = Path("/tmp/.sglang_tile_spec_finish")
-        if finish_flag.exists():
-            logger.info(f"TileSpec: Finish signal received ({len(self._latency_data)} samples collected)")
-            finish_flag.unlink()  # Clean up flag
-            self.finish_profiling()
-
     def finish_profiling(self):
         """Fit latency model from collected data."""
         if not self._profiling:
@@ -694,6 +687,7 @@ def tile_spec_warmup(
     server_args,
     generate_fn: Callable[[List[str]], None],
     check_ready_fn: Callable[[], bool],
+    finish_fn: Callable[[], None],
 ):
     """
     Run TileSpec warmup profiling through actual verify() path.
@@ -704,6 +698,7 @@ def tile_spec_warmup(
         server_args: Server args with model_path and tp_size
         generate_fn: Function to send generation requests, signature: (prompts: List[str]) -> None
         check_ready_fn: Function that returns True when profiling is complete
+        finish_fn: Function to signal profiling should finish
     """
     logger.info(f"TileSpec: warmup called, tile_spec={getattr(server_args, 'tile_spec', False)}")
     if not getattr(server_args, 'tile_spec', False):
@@ -760,21 +755,15 @@ def tile_spec_warmup(
 
     logger.info(f"TileSpec: Completed {total_runs} warmup runs")
 
-    # Signal profiling to finish via flag file (file-based IPC)
+    # Signal profiling to finish
     logger.info("TileSpec: Signaling profiling to finish...")
-    finish_flag = Path("/tmp/.sglang_tile_spec_finish")
-    finish_flag.touch()
-
-    # Send one more request to trigger the finish signal processing
-    # (record() only runs during verify() calls)
-    logger.info("TileSpec: Triggering finish signal processing...")
     try:
-        generate_fn([prompts[0]])
+        finish_fn()
     except Exception as e:
-        logger.warning(f"TileSpec: Final trigger request failed: {e}")
+        logger.warning(f"TileSpec: finish_fn() failed: {e}")
 
-    # Wait for profiling to complete
-    logger.info("TileSpec: Waiting for profiling to finish...")
+    # Wait for profiling to complete via polling
+    logger.info("TileSpec: Polling for profiling completion...")
     start_wait = time.time()
     max_wait = 120  # Maximum 2 minutes wait
 

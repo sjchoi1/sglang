@@ -1627,6 +1627,12 @@ def _execute_server_warmup(
             timeout=120,
         ),
         lambda: requests.get(url + "/get_server_info", timeout=5, headers=headers).json().get("tile_spec_ready", False),
+        lambda: requests.post(
+            url + "/set_internal_state",
+            json={"server_args": {"finish_tile_spec_profiling": True}},
+            headers=headers,
+            timeout=5,
+        ),
     )
 
     return success

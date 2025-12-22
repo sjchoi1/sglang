@@ -692,9 +692,14 @@ class EAGLEWorker(TpModelWorker):
             ).cpu()
 
         # Forward
+        verify_start_time = time.perf_counter()
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
+        torch.cuda.synchronize()
+        verify_end_time = time.perf_counter()
+        verify_latency_ms = (verify_end_time - verify_start_time) * 1000.0
+
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -749,6 +754,16 @@ class EAGLEWorker(TpModelWorker):
 
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
+
+        # Record TileSpec profiling data (latency only for now)
+        if hasattr(self, 'tile_spec_profiler') and self.tile_spec_profiler is not None:
+            num_tokens = spec_info.draft_token.shape[0] if not batch.forward_mode.is_idle() else 0
+            self.tile_spec_profiler.record(
+                num_tokens=num_tokens,
+                latency_ms=verify_latency_ms,
+                scores=None,  # TODO: Add score tracking
+                accepted=None,  # TODO: Add accepted mask
+            )
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
