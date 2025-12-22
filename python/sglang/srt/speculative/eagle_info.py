@@ -71,9 +71,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     # Shape info for padding
     num_tokens_per_batch: int = -1
 
-    # Per-request draft token counts (for TileSpec)
-    per_request_draft_token_num: torch.Tensor = None
-
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
 
@@ -255,44 +252,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         bs = self.retrive_index.shape[0]
-
-        # Handle per-request draft token counts (TileSpec)
-        # Target model already processed unpadded tokens efficiently
-        # Now pad logits and candidates for verification reshape
-        if self.per_request_draft_token_num is not None:
-            vocab_size = logits_output.next_token_logits.shape[-1]
-            max_draft = self.draft_token_num
-
-            # Create padded tensors
-            padded_logits = torch.full(
-                (bs * max_draft, vocab_size),
-                float('-inf'),  # Padding logits with -inf (never selected)
-                device=batch.device,
-                dtype=logits_output.next_token_logits.dtype
-            )
-            padded_candidates = torch.full(
-                (bs * max_draft,),
-                -1,  # Padding candidates with -1 (matches retrive_* padding)
-                dtype=self.draft_token.dtype,
-                device=batch.device
-            )
-
-            # Copy actual tokens to padded positions
-            offset = 0
-            for i in range(bs):
-                draft_count = int(self.per_request_draft_token_num[i].item())
-                start_idx = i * max_draft
-                # Copy actual logits and tokens
-                padded_logits[start_idx : start_idx + draft_count] = \
-                    logits_output.next_token_logits[offset : offset + draft_count]
-                padded_candidates[start_idx : start_idx + draft_count] = \
-                    self.draft_token[offset : offset + draft_count]
-                offset += draft_count
-
-            # Replace with padded versions for verification
-            logits_output.next_token_logits = padded_logits
-            self.draft_token = padded_candidates
-
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
 

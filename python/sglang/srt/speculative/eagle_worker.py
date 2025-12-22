@@ -46,7 +46,6 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
-from sglang.srt.speculative.tile_spec import TileSpecProfiler
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
@@ -102,13 +101,6 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-
-        # Tile-spec: automatic tile-aware speculation optimization
-        self.enable_tile_spec = getattr(server_args, 'tile_spec', False)
-        self.tile_spec_profiler = None
-        self.tile_spec_calibration = None
-        self.tile_spec_latency_model = None
-        self._tile_spec_scores = None
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -541,7 +533,7 @@ class EAGLEWorker(TpModelWorker):
             forward_batch
         )
         if can_cuda_graph:
-            parent_list, top_scores_index, draft_tokens, num_draft_tokens = self.cuda_graph_runner.replay(
+            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
             )
         else:
@@ -553,123 +545,35 @@ class EAGLEWorker(TpModelWorker):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
-            parent_list, top_scores_index, draft_tokens, num_draft_tokens = self.draft_forward(
+            parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
 
-        # Handle per-request draft tokens
-        per_request_draft_tokens = None
-        is_per_request_mode = isinstance(top_scores_index, list)
-
-        if is_per_request_mode:
-            # Per-request mode: build trees separately for each request (NO PADDING)
-            per_request_draft_tokens = num_draft_tokens
-            bs = len(top_scores_index)
-        else:
-            # Uniform mode
-            if isinstance(num_draft_tokens, torch.Tensor):
-                per_request_draft_tokens = num_draft_tokens
-                num_draft_tokens = int(num_draft_tokens.max().item())
-
         if batch.forward_mode.is_idle():
-            num_tokens_for_idle = num_draft_tokens if isinstance(num_draft_tokens, int) else int(num_draft_tokens.max().item())
             return EagleVerifyInput.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
-                num_tokens_for_idle,
+                self.speculative_num_draft_tokens,
             )
 
-        if is_per_request_mode:
-            # Build per-request trees and concatenate
-            # NOTE: We pad metadata tensors (retrive_*) to max_draft_token_num for batching,
-            # but draft_tokens remain exact (no padding) for efficiency
-            bs = len(per_request_draft_tokens)
-            max_draft_token_num = int(per_request_draft_tokens.max().item())
-            device = batch.seq_lens.device
-
-            all_tree_masks = []
-            all_positions = []
-            all_draft_tokens = []
-
-            # Preallocate padded metadata tensors
-            retrive_index = torch.full((bs, max_draft_token_num), -1, dtype=torch.long, device=device)
-            retrive_next_token = torch.full((bs, max_draft_token_num), -1, dtype=torch.long, device=device)
-            retrive_next_sibling = torch.full((bs, max_draft_token_num), -1, dtype=torch.long, device=device)
-
-            total_tokens = 0
-
-            for i in range(bs):
-                draft_token_num_i = int(per_request_draft_tokens[i].item())
-
-                # Extract parent list for this request
-                if len(parent_list.shape) == 2:
-                    parent_list_i = parent_list[i:i+1]
-                else:
-                    parent_list_i = torch.empty(1, 0, device=device)
-
-                # Build tree for this request with exact draft_token_num_i tokens
-                (
-                    tree_mask_i,
-                    position_i,
-                    retrive_index_i,
-                    retrive_next_token_i,
-                    retrive_next_sibling_i,
-                    draft_tokens_i,
-                ) = build_tree_kernel_efficient(
-                    spec_info.verified_id[i:i+1],
-                    parent_list_i,
-                    top_scores_index[i].unsqueeze(0),
-                    draft_tokens[i].unsqueeze(0),
-                    batch.seq_lens[i:i+1],
-                    batch.seq_lens[i].item(),
-                    self.topk,
-                    self.speculative_num_steps,
-                    draft_token_num_i,
-                )
-
-                # Collect tree masks and positions (variable size per request)
-                all_tree_masks.append(tree_mask_i)
-                all_positions.append(position_i)
-
-                # Fill padded metadata tensors (retrive_* need uniform shape)
-                retrive_index[i, :draft_token_num_i] = retrive_index_i[0, :draft_token_num_i]
-                retrive_next_token[i, :draft_token_num_i] = retrive_next_token_i[0, :draft_token_num_i]
-                retrive_next_sibling[i, :draft_token_num_i] = retrive_next_sibling_i[0, :draft_token_num_i]
-
-                # Draft tokens: exact count, NO PADDING
-                all_draft_tokens.append(draft_tokens_i)
-
-                total_tokens += draft_token_num_i
-
-            # Concatenate variable-size outputs
-            tree_mask = torch.cat(all_tree_masks, dim=0)
-            position = torch.cat(all_positions, dim=0)
-            draft_tokens = torch.cat(all_draft_tokens, dim=0)
-
-            # draft_token_num is max_draft_token_num for compatibility with metadata tensors
-            # actual per-request counts stored in per_request_draft_token_num
-            draft_token_num = max_draft_token_num
-        else:
-            # Uniform mode: original single call
-            (
-                tree_mask,
-                position,
-                retrive_index,
-                retrive_next_token,
-                retrive_next_sibling,
-                draft_tokens,
-            ) = build_tree_kernel_efficient(
-                spec_info.verified_id,
-                parent_list,
-                top_scores_index,
-                draft_tokens,
-                batch.seq_lens,
-                batch.seq_lens_sum,
-                self.topk,
-                self.speculative_num_steps,
-                num_draft_tokens,
-            )
-            draft_token_num = num_draft_tokens
+        (
+            tree_mask,
+            position,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_efficient(
+            spec_info.verified_id,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            batch.seq_lens,
+            batch.seq_lens_sum,
+            self.topk,
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+        )
 
         return EagleVerifyInput(
             draft_token=draft_tokens,
@@ -681,11 +585,10 @@ class EAGLEWorker(TpModelWorker):
             retrive_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
-            draft_token_num=draft_token_num,
+            draft_token_num=self.server_args.speculative_num_draft_tokens,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
-            per_request_draft_token_num=per_request_draft_tokens,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -754,30 +657,11 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-        # Organize draft results (TileSpec optimization handled inside)
-        is_tilespec_profiling = self.enable_tile_spec and self.tile_spec_profiler and self.tile_spec_profiler.is_profiling()
-
-        parent_list, top_scores_index, draft_tokens, per_request_draft_token_num = organize_draft_results(
-            score_list,
-            token_list,
-            parents_list,
-            self.speculative_num_draft_tokens,
-            calibration=self.tile_spec_calibration if self.enable_tile_spec else None,
-            latency_model=self.tile_spec_latency_model if self.enable_tile_spec else None,
-            is_tilespec_profiling=is_tilespec_profiling,
+        parent_list, top_scores_index, draft_tokens = organize_draft_results(
+            score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
 
-        # Store scores for calibration during profiling
-        if is_tilespec_profiling and per_request_draft_token_num is not None:
-            scores_cat = torch.cat(score_list, dim=1).flatten(1)
-            max_draft_token_num = int(per_request_draft_token_num.max().item())
-            self._tile_spec_scores = scores_cat[:, :max_draft_token_num]
-            self._tile_spec_per_request_draft_token_num = per_request_draft_token_num
-
-        # Return per_request_draft_token_num if TileSpec, else fixed num_draft_tokens
-        num_draft_tokens = per_request_draft_token_num if per_request_draft_token_num is not None else self.speculative_num_draft_tokens
-
-        return parent_list, top_scores_index, draft_tokens, num_draft_tokens
+        return parent_list, top_scores_index, draft_tokens
 
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker
@@ -786,10 +670,6 @@ class EAGLEWorker(TpModelWorker):
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
-
-        # Capture actual verify token count for profiling (after prepare_for_verify sets batch.input_ids)
-        _actual_verify_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
-
         spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
         batch.return_hidden_states = False
         batch.forward_mode = (
@@ -810,12 +690,6 @@ class EAGLEWorker(TpModelWorker):
             draft_tokens_cpu = spec_info.draft_token.view(
                 spec_info.retrive_next_token.shape
             ).cpu()
-
-        # Tile-spec profiling: measure verification latency
-        _profile_start = None
-        if self.enable_tile_spec and self.tile_spec_profiler and self.tile_spec_profiler.is_profiling():
-            torch.cuda.synchronize()
-            _profile_start = time.perf_counter()
 
         # Forward
         batch_result = self.target_worker.forward_batch_generation(
@@ -875,52 +749,6 @@ class EAGLEWorker(TpModelWorker):
 
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
-
-        # Tile-spec profiling: record latency and calibration data
-        if _profile_start is not None:
-            torch.cuda.synchronize()
-            latency_ms = (time.perf_counter() - _profile_start) * 1000
-
-            # Use actual verify token count (captured after prepare_for_verify)
-            num_tokens = _actual_verify_tokens
-
-            # Build accepted mask for calibration
-            scores = self._tile_spec_scores
-            accepted = None
-            if scores is not None:
-                bs = len(res.accept_length_per_req_cpu)
-                if spec_info.per_request_draft_token_num is not None:
-                    # Per-request: collect only valid positions (NO PADDING)
-                    per_request_draft_token_num = getattr(self, '_tile_spec_per_request_draft_token_num', None)
-                    if per_request_draft_token_num is not None:
-                        # Collect valid score/accepted pairs per request, then concatenate
-                        scores_list = []
-                        accepted_list = []
-                        for i, acc_len in enumerate(res.accept_length_per_req_cpu):
-                            draft_token_num_i = int(per_request_draft_token_num[i].item())
-                            # Only include valid positions up to draft_token_num_i
-                            scores_list.append(scores[i, :draft_token_num_i])
-                            accepted_i = torch.zeros(draft_token_num_i, dtype=torch.bool, device=scores.device)
-                            accepted_i[:min(acc_len, draft_token_num_i)] = True
-                            accepted_list.append(accepted_i)
-                        # Concatenate into 1D arrays (no padding)
-                        scores = torch.cat(scores_list, dim=0).unsqueeze(0)  # [1, total_valid]
-                        accepted = torch.cat(accepted_list, dim=0).unsqueeze(0)  # [1, total_valid]
-                else:
-                    # Uniform: original logic
-                    draft_k = spec_info.draft_token_num
-                    accepted = torch.zeros(bs, draft_k, dtype=torch.bool, device=scores.device)
-                    for i, acc_len in enumerate(res.accept_length_per_req_cpu):
-                        accepted[i, :acc_len] = True
-                # Clear temporary profiling data
-                self._tile_spec_scores = None
-                self._tile_spec_per_request_draft_token_num = None
-
-            self.tile_spec_profiler.record(num_tokens, latency_ms, scores, accepted)
-
-            # Update worker models after profiling completes
-            if self.tile_spec_latency_model is None and self.tile_spec_profiler.latency_model is not None:
-                self.tile_spec_latency_model, self.tile_spec_calibration = self.tile_spec_profiler.get_models()
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
@@ -1238,20 +1066,6 @@ class EAGLEWorker(TpModelWorker):
             load_format=recv_req.load_format,
         )
         return success, message
-
-    def init_tile_spec(self):
-        """Initialize tile-spec profiler."""
-        if not self.enable_tile_spec:
-            return
-
-        self.tile_spec_profiler = TileSpecProfiler(self.server_args)
-
-        # Try to load from cache first
-        self.tile_spec_latency_model, self.tile_spec_calibration = self.tile_spec_profiler.get_models()
-
-        if not self.tile_spec_latency_model:
-            # Start profiling - data collected during warmup via verify() calls
-            self.tile_spec_profiler.start_profiling()
 
 
 @torch.compile(dynamic=True, disable=_is_npu)

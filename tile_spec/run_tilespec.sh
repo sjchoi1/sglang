@@ -10,4 +10,5 @@ sglang serve --model-path meta-llama/Llama-3.1-8B-Instruct \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --dtype float16 \
-    --tile-spec
+    --tile-spec \
+    --disable-cuda-graph

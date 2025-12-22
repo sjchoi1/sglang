@@ -358,10 +358,6 @@ class Scheduler(
             **draft_worker_kwargs
         )
 
-        # Initialize tile-spec profiling if enabled
-        if server_args.tile_spec and hasattr(self.draft_worker, 'init_tile_spec'):
-            self.draft_worker.init_tile_spec()
-
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
@@ -2371,24 +2367,6 @@ class Scheduler(
             ret["avg_spec_accept_length"] = (
                 self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
             )
-
-        # Tile-spec profiler status
-        tile_spec_enabled = getattr(self.server_args, 'tile_spec', False)
-        if not tile_spec_enabled:
-            ret["tile_spec_ready"] = True  # Not enabled = always ready
-        elif hasattr(self, "draft_worker") and self.draft_worker is not None:
-            profiler = getattr(self.draft_worker, "tile_spec_profiler", None)
-            if profiler is not None:
-                # Ready when latency model exists
-                has_model = profiler.latency_model is not None
-                ret["tile_spec_ready"] = has_model
-                logger.info(f"TileSpec: profiler exists, latency_model={'exists' if has_model else 'None'}, tile_spec_ready={has_model}")
-            else:
-                ret["tile_spec_ready"] = False  # Profiler not created yet
-                logger.info("TileSpec: profiler is None, tile_spec_ready=False")
-        else:
-            ret["tile_spec_ready"] = False  # Draft worker not ready yet
-            logger.info(f"TileSpec: draft_worker not ready, tile_spec_ready=False (has_draft_worker={hasattr(self, 'draft_worker')}, is_none={getattr(self, 'draft_worker', None) is None})")
 
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict

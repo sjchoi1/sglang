@@ -312,10 +312,8 @@ class EAGLEDraftCudaGraphRunner:
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         # Keep the variables name for readability
-        # out has 4 elements: parent_list, top_scores_index, draft_tokens, num_draft_tokens
-        parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out[:3])
-        num_draft_tokens = out[3]  # scalar, no slicing needed
-        return parent_list, top_scores_index, draft_tokens, num_draft_tokens
+        parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)
+        return parent_list, top_scores_index, draft_tokens
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None

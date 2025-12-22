@@ -1950,6 +1950,13 @@ class ServerArgs:
                     "Currently standalone speculative decoding does not support dp attention."
                 )
 
+            # TileSpec requires CUDA graphs to be disabled
+            if self.tile_spec and not self.disable_cuda_graph:
+                raise ValueError(
+                    "TileSpec (--tile-spec) requires CUDA graphs to be disabled (--disable-cuda-graph). "
+                    "TileSpec uses dynamic per-request token selection which is incompatible with CUDA graph capture."
+                )
+
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(
