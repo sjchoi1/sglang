@@ -51,6 +51,58 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
+def _pad_to_2d(flat_tensor, per_request_counts, max_count, pad_value=-1):
+    """
+    Pad ragged flattened tensor to uniform 2D [bs, max_count, ...].
+
+    Args:
+        flat_tensor: Flattened ragged tensor [total_tokens] or [total_tokens, ...]
+        per_request_counts: Tensor [bs] with actual counts per request
+        max_count: Maximum count to pad to
+        pad_value: Value to use for padding (default: -1 for token IDs)
+
+    Returns:
+        Padded tensor [bs, max_count] or [bs, max_count, ...]
+
+    Example:
+        flat_tensor = [V0, t01, t02, V1, t11, t12, t13, t14, V2, t21]
+        per_request_counts = [3, 5, 2]
+        max_count = 5
+
+        Returns:
+        [[V0, t01, t02, -1, -1],
+         [V1, t11, t12, t13, t14],
+         [V2, t21, -1, -1, -1]]
+    """
+    bs = per_request_counts.shape[0]
+    device = flat_tensor.device
+    dtype = flat_tensor.dtype
+
+    # Determine output shape based on input dimensions
+    if flat_tensor.ndim == 1:
+        # Token IDs: [total_tokens] → [bs, max_count]
+        output_shape = (bs, max_count)
+    elif flat_tensor.ndim == 2:
+        # Probabilities: [total_tokens, vocab_size] → [bs, max_count, vocab_size]
+        output_shape = (bs, max_count, flat_tensor.shape[1])
+    else:
+        raise ValueError(f"Unsupported tensor dimension: {flat_tensor.ndim}")
+
+    # Create padded tensor filled with pad_value
+    padded = torch.full(output_shape, pad_value, dtype=dtype, device=device)
+
+    # Copy actual values from flattened tensor
+    offset = 0
+    for i, count in enumerate(per_request_counts.tolist()):
+        if flat_tensor.ndim == 1:
+            padded[i, :count] = flat_tensor[offset:offset+count]
+        else:  # ndim == 2
+            padded[i, :count, :] = flat_tensor[offset:offset+count, :]
+        offset += count
+
+    return padded
+
+
 @dataclass
 class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
@@ -67,6 +119,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
+
+    # Per-request draft token counts (TileSpec support)
+    # None = uniform (all requests have draft_token_num drafts)
+    # Tensor [bs] = per-request counts (can vary)
+    per_request_draft_token_num: Optional[torch.Tensor] = None
 
     # Shape info for padding
     num_tokens_per_batch: int = -1
@@ -108,17 +165,25 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         batch.input_ids = self.draft_token
 
+        # Determine draft token counts per request (uniform or per-request)
+        if self.per_request_draft_token_num is not None:
+            draft_counts = self.per_request_draft_token_num
+            draft_counts_cpu = self.per_request_draft_token_num.cpu()
+        else:
+            draft_counts = self.draft_token_num
+            draft_counts_cpu = self.draft_token_num
+
         if page_size == 1:
             batch.out_cache_loc = alloc_token_slots(
                 batch.tree_cache,
                 len(batch.input_ids),
             )
-            end_offset = batch.seq_lens + self.draft_token_num
+            end_offset = batch.seq_lens + draft_counts
         else:
             prefix_lens = batch.seq_lens
             prefix_lens_cpu = batch.seq_lens_cpu
-            end_offset = prefix_lens + self.draft_token_num
-            end_offset_cpu = prefix_lens_cpu + self.draft_token_num
+            end_offset = prefix_lens + draft_counts
+            end_offset_cpu = prefix_lens_cpu + draft_counts_cpu
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
@@ -192,10 +257,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             kv_indices,
             req_to_token.size(1),
         )
-        mask_numel = (
-            paged_kernel_lens_sum * self.draft_token_num
-            + (self.draft_token_num**2) * batch_size
-        )
+        # Calculate custom mask size (handles both uniform and per-request draft counts)
+        if self.per_request_draft_token_num is not None:
+            # Per-request variable counts: sum actual tokens and sum of squares
+            total_verify_tokens = self.per_request_draft_token_num.sum().item()
+            draft_draft_size = sum(c**2 for c in self.per_request_draft_token_num.tolist())
+            mask_numel = paged_kernel_lens_sum * total_verify_tokens + draft_draft_size
+        else:
+            # Uniform counts: original formula
+            mask_numel = (
+                paged_kernel_lens_sum * self.draft_token_num
+                + (self.draft_token_num**2) * batch_size
+            )
         if self.custom_mask.numel() < mask_numel:
             # FIXME(attn): temporary fix for custom mask padding with cuda graph
             self.custom_mask = torch.cat(
@@ -252,7 +325,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         bs = self.retrive_index.shape[0]
-        candidates = self.draft_token.reshape(bs, self.draft_token_num)
+
+        # Handle both uniform and per-request draft tokens
+        if self.per_request_draft_token_num is not None:
+            # Ragged case: pad to max count for verification kernel
+            max_count = self.per_request_draft_token_num.max().item()
+            candidates = _pad_to_2d(
+                self.draft_token, self.per_request_draft_token_num, max_count, pad_value=-1
+            )
+        else:
+            # Uniform case: simple reshape
+            candidates = self.draft_token.reshape(bs, self.draft_token_num)
+
         sampling_info = batch.sampling_info
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
@@ -268,12 +352,22 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             # NOTE: retrive_index are the indices of the requests that are kept.
             sampling_info.filter_batch(self.retrive_index.tolist(), self.retrive_index)
 
+        # Determine tokens per request for penalties and processors
+        if self.per_request_draft_token_num is not None:
+            # Per-request: use actual counts
+            tokens_per_request = self.per_request_draft_token_num
+            num_tokens_in_batch = self.per_request_draft_token_num.max().item()
+        else:
+            # Uniform: use constant draft_token_num
+            tokens_per_request = self.draft_token_num
+            num_tokens_in_batch = self.draft_token_num
+
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(
                 logits_output.next_token_logits,
                 sampling_info,
-                num_tokens_in_batch=self.draft_token_num,
+                num_tokens_in_batch=num_tokens_in_batch,
             )
 
         # Apply penalty
@@ -289,7 +383,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
             sampling_info.apply_logits_bias(linear_penalty)
             logits_output.next_token_logits.add_(
-                torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
+                torch.repeat_interleave(linear_penalty, tokens_per_request, dim=0)
             )
 
         # Apply grammar mask
@@ -309,7 +403,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
-            target_predict = target_predict.reshape(bs, self.draft_token_num)
+
+            # Handle both uniform and per-request draft tokens
+            if self.per_request_draft_token_num is not None:
+                # Ragged case: pad to max count
+                max_count = self.per_request_draft_token_num.max().item()
+                target_predict = _pad_to_2d(
+                    target_predict, self.per_request_draft_token_num, max_count, pad_value=-1
+                )
+            else:
+                # Uniform case: simple reshape
+                target_predict = target_predict.reshape(bs, self.draft_token_num)
+
             predict, accept_index, accept_length = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -323,28 +428,46 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         else:
+            # Determine repeat counts for per-request or uniform case
+            if self.per_request_draft_token_num is not None:
+                # Per-request: use actual counts for repeat_interleave
+                repeat_counts = self.per_request_draft_token_num
+            else:
+                # Uniform: use constant draft_token_num
+                repeat_counts = self.draft_token_num
+
             # apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, self.draft_token_num, dim=0
-            )  # (bs * draft_token_num, 1)
+                sampling_info.temperatures, repeat_counts, dim=0
+            )  # (total_tokens, 1)
 
             target_probs = F.softmax(
                 logits_output.next_token_logits / expanded_temperature, dim=-1
-            )  # (bs * draft_token_num, vocab_size)
+            )  # (total_tokens, vocab_size)
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
-                    sampling_info.top_ks, self.draft_token_num, dim=0
+                    sampling_info.top_ks, repeat_counts, dim=0
                 ),
-            )  # (bs * draft_token_num, vocab_size)
+            )  # (total_tokens, vocab_size)
             if not torch.all(sampling_info.top_ps == 1.0):
                 target_probs = top_p_renorm_prob(
                     target_probs,
                     torch.repeat_interleave(
-                        sampling_info.top_ps, self.draft_token_num, dim=0
+                        sampling_info.top_ps, repeat_counts, dim=0
                     ),
                 )
-            target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
+
+            # Handle both uniform and per-request draft tokens
+            if self.per_request_draft_token_num is not None:
+                # Ragged case: pad to max count
+                max_count = self.per_request_draft_token_num.max().item()
+                target_probs = _pad_to_2d(
+                    target_probs, self.per_request_draft_token_num, max_count, pad_value=0.0
+                )
+            else:
+                # Uniform case: simple reshape
+                target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
             draft_probs = torch.zeros(
                 target_probs.shape, dtype=torch.float32, device=batch.device

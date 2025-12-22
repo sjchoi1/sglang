@@ -545,7 +545,7 @@ class EAGLEWorker(TpModelWorker):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
-            parent_list, top_scores_index, draft_tokens = self.draft_forward(
+            parent_list, top_scores_index, draft_tokens, per_request_draft_token_num = self.draft_forward(
                 forward_batch
             )
 
@@ -589,6 +589,7 @@ class EAGLEWorker(TpModelWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
+            per_request_draft_token_num=per_request_draft_token_num,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -657,11 +658,27 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-        parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
+        # Get TileSpec profiling state and models
+        is_tilespec_profiling = False
+        calibration = None
+        latency_model = None
+        if hasattr(self, 'tile_spec_profiler') and self.tile_spec_profiler is not None:
+            is_tilespec_profiling = self.tile_spec_profiler.is_profiling()
+            if not is_tilespec_profiling:
+                # Runtime: get calibrated models
+                latency_model, calibration = self.tile_spec_profiler.get_models()
+
+        parent_list, top_scores_index, draft_tokens, per_request_draft_token_num = organize_draft_results(
+            score_list,
+            token_list,
+            parents_list,
+            self.speculative_num_draft_tokens,
+            calibration=calibration,
+            latency_model=latency_model,
+            is_tilespec_profiling=is_tilespec_profiling,
         )
 
-        return parent_list, top_scores_index, draft_tokens
+        return parent_list, top_scores_index, draft_tokens, per_request_draft_token_num
 
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker
@@ -801,13 +818,24 @@ class EAGLEWorker(TpModelWorker):
                 cumulative_accepted_lengths[:-1],
             ]
         )
-        accepted_indices_offset = torch.arange(
-            0,
-            len(batch.seq_lens) * batch.spec_info.draft_token_num,
-            step=batch.spec_info.draft_token_num,
-            dtype=accepted_indices_start.dtype,
-            device=accepted_indices_start.device,
-        )
+        # Compute offsets for mapping kernel results to actual flattened positions
+        if batch.spec_info.per_request_draft_token_num is not None:
+            # Ragged case: use cumulative offsets based on actual per-request counts
+            # Example: [3, 5, 2] → cumsum → [3, 8, 10] → prepend 0 → [0, 3, 8]
+            cumsum = torch.cat([
+                torch.tensor([0], dtype=torch.long, device=accepted_indices_start.device),
+                batch.spec_info.per_request_draft_token_num.cumsum(0)[:-1]
+            ])
+            accepted_indices_offset = cumsum
+        else:
+            # Uniform case: use stride-based offsets (all chunks are draft_token_num apart)
+            accepted_indices_offset = torch.arange(
+                0,
+                len(batch.seq_lens) * batch.spec_info.draft_token_num,
+                step=batch.spec_info.draft_token_num,
+                dtype=accepted_indices_start.dtype,
+                device=accepted_indices_start.device,
+            )
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         # res.accepted_indices.shape[0] > 0 skips DP attn idle batch

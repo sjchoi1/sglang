@@ -151,12 +151,33 @@ def build_tree_kernel_efficient(
     tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
+    per_request_draft_token_num: Optional[torch.Tensor] = None,
 ):
-    draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
+    # Handle both uniform (Tensor) and ragged (List[Tensor]) draft tokens
+    if isinstance(draft_tokens, list):
+        # Ragged case: per-request variable draft counts
+        draft_tokens_with_verified = []
+        for i, req_drafts in enumerate(draft_tokens):
+            draft_tokens_with_verified.append(torch.cat([verified_id[i:i+1], req_drafts]))
+        draft_tokens = torch.cat(draft_tokens_with_verified)
+
+        # Also flatten top_scores_index (which is also a list in ragged case)
+        top_scores_index = torch.cat(top_scores_index) if isinstance(top_scores_index, list) else top_scores_index
+    else:
+        # Uniform case: original logic
+        draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
 
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
     bs = seq_lens.numel()
     device = seq_lens.device
+
+    # Calculate actual verify token counts (uniform or per-request)
+    if per_request_draft_token_num is not None:
+        total_verify_tokens = per_request_draft_token_num.sum().item()  # Sum for flattened buffers
+        max_verify_tokens = per_request_draft_token_num.max().item()    # Max for per-batch buffers
+    else:
+        total_verify_tokens = bs * num_verify_tokens
+        max_verify_tokens = num_verify_tokens
     # e.g. for bs=1, tree_mask: num_draft_token, seq_lens_sum + num_draft_token (flattened)
     # where each row indicates the attending pattern of each draft token
     # if use_partial_packed_tree_mask is True, tree_mask: num_draft_token (flattened, packed)
@@ -171,8 +192,13 @@ def build_tree_kernel_efficient(
         else:
             raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
     elif tree_mask_mode == TreeMaskMode.QLEN_ONLY:
+        # QLEN_ONLY: num_verify_tokens^2 per request
+        if per_request_draft_token_num is not None:
+            mask_size = sum(c**2 for c in per_request_draft_token_num.tolist())
+        else:
+            mask_size = num_verify_tokens * bs * num_verify_tokens
         tree_mask = torch.full(
-            (num_verify_tokens * bs * num_verify_tokens,),
+            (mask_size,),
             True,
             dtype=torch.bool,
             device=device,
@@ -180,17 +206,29 @@ def build_tree_kernel_efficient(
     elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
         packed_dtypes = [torch.uint8, torch.uint16, torch.uint32]
         packed_dtype_idx = int(math.ceil(math.log2((num_verify_tokens + 7) // 8)))
+        # BITPACKING: num_verify_tokens per request (packed)
+        if per_request_draft_token_num is not None:
+            mask_size = per_request_draft_token_num.sum().item()
+        else:
+            mask_size = num_verify_tokens * bs
         tree_mask = torch.zeros(
-            (num_verify_tokens * bs,),
+            (mask_size,),
             dtype=packed_dtypes[packed_dtype_idx],
             device=device,
         )
     elif tree_mask_mode == TreeMaskMode.FULL_MASK:
-        tree_mask = torch.full(
-            (
+        # FULL_MASK: prompt→draft + draft→draft attention
+        if per_request_draft_token_num is not None:
+            total_verify_tokens = per_request_draft_token_num.sum().item()
+            draft_draft_size = sum(c**2 for c in per_request_draft_token_num.tolist())
+            mask_size = seq_lens_sum * total_verify_tokens + draft_draft_size
+        else:
+            mask_size = (
                 seq_lens_sum * num_verify_tokens
-                + num_verify_tokens * num_verify_tokens * bs,
-            ),
+                + num_verify_tokens * num_verify_tokens * bs
+            )
+        tree_mask = torch.full(
+            (mask_size,),
             True,
             device=device,
         )
@@ -198,19 +236,29 @@ def build_tree_kernel_efficient(
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
 
     # TODO: make them torch.empty and fuse them into `sgl_build_tree_kernel`
+    # retrive_buf: per-batch structure [3, bs, max_tokens_per_request]
+    # Use max_verify_tokens to accommodate the request with most tokens
     retrive_buf = torch.full(
-        (3, bs, num_verify_tokens), -1, device=device, dtype=torch.long
+        (3, bs, max_verify_tokens), -1, device=device, dtype=torch.long
     )
     retrive_index, retrive_next_token, retrive_next_sibling = retrive_buf
     # position: where each token belongs to
     # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7
     # then, positions = [7, 8, 8, 9]
+    # positions: flattened globally [total_tokens_across_all_requests]
+    # Use total_verify_tokens (sum of per-request counts)
     if position_buf is not None:
         positions = position_buf
     else:
         positions = torch.empty(
-            (bs * num_verify_tokens,), device=device, dtype=torch.long
+            (total_verify_tokens,), device=device, dtype=torch.long
         )
+
+    # Prepare per_request_draft_token_num parameter (empty tensor if None)
+    if per_request_draft_token_num is not None:
+        per_request_counts_arg = per_request_draft_token_num
+    else:
+        per_request_counts_arg = torch.empty(0, dtype=torch.long, device=device)
 
     if _is_npu:
         torch.ops.npu.build_tree_kernel_efficient(
@@ -226,6 +274,7 @@ def build_tree_kernel_efficient(
             spec_steps,
             num_verify_tokens,
             tree_mask_mode,
+            per_request_counts_arg,
         )
     else:
         sgl_build_tree_kernel_efficient(
@@ -241,6 +290,7 @@ def build_tree_kernel_efficient(
             spec_steps,
             num_verify_tokens,
             tree_mask_mode,
+            per_request_counts_arg,
         )
     return (
         tree_mask,
