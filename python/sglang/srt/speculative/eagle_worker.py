@@ -581,10 +581,10 @@ class EAGLEWorker(TpModelWorker):
 
         if is_per_request_mode:
             # Build per-request trees and concatenate
-            # NOTE: We pad metadata tensors (retrive_*) to max_k for batching,
+            # NOTE: We pad metadata tensors (retrive_*) to max_draft_token_num for batching,
             # but draft_tokens remain exact (no padding) for efficiency
             bs = len(per_request_draft_tokens)
-            max_k = int(per_request_draft_tokens.max().item())
+            max_draft_token_num = int(per_request_draft_tokens.max().item())
             device = batch.seq_lens.device
 
             all_tree_masks = []
@@ -592,14 +592,14 @@ class EAGLEWorker(TpModelWorker):
             all_draft_tokens = []
 
             # Preallocate padded metadata tensors
-            retrive_index = torch.full((bs, max_k), -1, dtype=torch.long, device=device)
-            retrive_next_token = torch.full((bs, max_k), -1, dtype=torch.long, device=device)
-            retrive_next_sibling = torch.full((bs, max_k), -1, dtype=torch.long, device=device)
+            retrive_index = torch.full((bs, max_draft_token_num), -1, dtype=torch.long, device=device)
+            retrive_next_token = torch.full((bs, max_draft_token_num), -1, dtype=torch.long, device=device)
+            retrive_next_sibling = torch.full((bs, max_draft_token_num), -1, dtype=torch.long, device=device)
 
             total_tokens = 0
 
             for i in range(bs):
-                k_i = int(per_request_draft_tokens[i].item())
+                draft_token_num_i = int(per_request_draft_tokens[i].item())
 
                 # Extract parent list for this request
                 if len(parent_list.shape) == 2:
@@ -607,7 +607,7 @@ class EAGLEWorker(TpModelWorker):
                 else:
                     parent_list_i = torch.empty(1, 0, device=device)
 
-                # Build tree for this request with exact k_i tokens
+                # Build tree for this request with exact draft_token_num_i tokens
                 (
                     tree_mask_i,
                     position_i,
@@ -624,7 +624,7 @@ class EAGLEWorker(TpModelWorker):
                     batch.seq_lens[i].item(),
                     self.topk,
                     self.speculative_num_steps,
-                    k_i,
+                    draft_token_num_i,
                 )
 
                 # Collect tree masks and positions (variable size per request)
@@ -632,23 +632,23 @@ class EAGLEWorker(TpModelWorker):
                 all_positions.append(position_i)
 
                 # Fill padded metadata tensors (retrive_* need uniform shape)
-                retrive_index[i, :k_i] = retrive_index_i[0, :k_i]
-                retrive_next_token[i, :k_i] = retrive_next_token_i[0, :k_i]
-                retrive_next_sibling[i, :k_i] = retrive_next_sibling_i[0, :k_i]
+                retrive_index[i, :draft_token_num_i] = retrive_index_i[0, :draft_token_num_i]
+                retrive_next_token[i, :draft_token_num_i] = retrive_next_token_i[0, :draft_token_num_i]
+                retrive_next_sibling[i, :draft_token_num_i] = retrive_next_sibling_i[0, :draft_token_num_i]
 
                 # Draft tokens: exact count, NO PADDING
                 all_draft_tokens.append(draft_tokens_i)
 
-                total_tokens += k_i
+                total_tokens += draft_token_num_i
 
             # Concatenate variable-size outputs
             tree_mask = torch.cat(all_tree_masks, dim=0)
             position = torch.cat(all_positions, dim=0)
             draft_tokens = torch.cat(all_draft_tokens, dim=0)
 
-            # draft_token_num is max_k for compatibility with metadata tensors
+            # draft_token_num is max_draft_token_num for compatibility with metadata tensors
             # actual per-request counts stored in per_request_draft_token_num
-            draft_token_num = max_k
+            draft_token_num = max_draft_token_num
         else:
             # Uniform mode: original single call
             (
@@ -757,7 +757,7 @@ class EAGLEWorker(TpModelWorker):
         # Organize draft results (TileSpec optimization handled inside)
         is_tilespec_profiling = self.enable_tile_spec and self.tile_spec_profiler and self.tile_spec_profiler.is_profiling()
 
-        parent_list, top_scores_index, draft_tokens, per_request_k = organize_draft_results(
+        parent_list, top_scores_index, draft_tokens, per_request_draft_token_num = organize_draft_results(
             score_list,
             token_list,
             parents_list,
@@ -768,14 +768,14 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # Store scores for calibration during profiling
-        if is_tilespec_profiling and per_request_k is not None:
+        if is_tilespec_profiling and per_request_draft_token_num is not None:
             scores_cat = torch.cat(score_list, dim=1).flatten(1)
-            max_k = int(per_request_k.max().item())
-            self._tile_spec_scores = scores_cat[:, :max_k]
-            self._tile_spec_per_request_k = per_request_k
+            max_draft_token_num = int(per_request_draft_token_num.max().item())
+            self._tile_spec_scores = scores_cat[:, :max_draft_token_num]
+            self._tile_spec_per_request_draft_token_num = per_request_draft_token_num
 
-        # Return per_request_k if TileSpec, else fixed num_draft_tokens
-        num_draft_tokens = per_request_k if per_request_k is not None else self.speculative_num_draft_tokens
+        # Return per_request_draft_token_num if TileSpec, else fixed num_draft_tokens
+        num_draft_tokens = per_request_draft_token_num if per_request_draft_token_num is not None else self.speculative_num_draft_tokens
 
         return parent_list, top_scores_index, draft_tokens, num_draft_tokens
 
@@ -891,29 +891,30 @@ class EAGLEWorker(TpModelWorker):
                 bs = len(res.accept_length_per_req_cpu)
                 if spec_info.per_request_draft_token_num is not None:
                     # Per-request: collect only valid positions (NO PADDING)
-                    per_request_k = getattr(self, '_tile_spec_per_request_k', None)
-                    if per_request_k is not None:
+                    per_request_draft_token_num = getattr(self, '_tile_spec_per_request_draft_token_num', None)
+                    if per_request_draft_token_num is not None:
                         # Collect valid score/accepted pairs per request, then concatenate
                         scores_list = []
                         accepted_list = []
                         for i, acc_len in enumerate(res.accept_length_per_req_cpu):
-                            k_i = int(per_request_k[i].item())
-                            # Only include valid positions up to k_i
-                            scores_list.append(scores[i, :k_i])
-                            accepted_i = torch.zeros(k_i, dtype=torch.bool, device=scores.device)
-                            accepted_i[:min(acc_len, k_i)] = True
+                            draft_token_num_i = int(per_request_draft_token_num[i].item())
+                            # Only include valid positions up to draft_token_num_i
+                            scores_list.append(scores[i, :draft_token_num_i])
+                            accepted_i = torch.zeros(draft_token_num_i, dtype=torch.bool, device=scores.device)
+                            accepted_i[:min(acc_len, draft_token_num_i)] = True
                             accepted_list.append(accepted_i)
                         # Concatenate into 1D arrays (no padding)
                         scores = torch.cat(scores_list, dim=0).unsqueeze(0)  # [1, total_valid]
                         accepted = torch.cat(accepted_list, dim=0).unsqueeze(0)  # [1, total_valid]
-                        self._tile_spec_per_request_k = None
                 else:
                     # Uniform: original logic
                     draft_k = spec_info.draft_token_num
                     accepted = torch.zeros(bs, draft_k, dtype=torch.bool, device=scores.device)
                     for i, acc_len in enumerate(res.accept_length_per_req_cpu):
                         accepted[i, :acc_len] = True
+                # Clear temporary profiling data
                 self._tile_spec_scores = None
+                self._tile_spec_per_request_draft_token_num = None
 
             self.tile_spec_profiler.record(num_tokens, latency_ms, scores, accepted)
 

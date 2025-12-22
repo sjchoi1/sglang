@@ -221,15 +221,13 @@ def tile_spec_warmup(
 class TileSpecProfiler:
     """Profiles tile-spec latency using actual sglang runs."""
 
-    def __init__(self, server_args, min_samples: int = 70):
+    def __init__(self, server_args):
         self.server_args = server_args
         self.cache_dir = get_cache_dir(
             server_args.model_path,
             torch.cuda.get_device_name(0),
             server_args.tp_size,
         )
-        self.min_samples = min_samples
-        self.min_unique_counts = 6  # Require at least 6 different token counts
         self._profiling = False
         self._latency_data: List[Tuple[int, float]] = []
         self._calibration_data: List[Tuple[float, bool]] = []

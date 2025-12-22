@@ -41,7 +41,7 @@ def organize_draft_results(
         parent_list: Parent indices for tree building
         top_scores_index: Selected token indices (tensor or list)
         draft_tokens: Selected tokens (tensor or list)
-        per_request_k: Per-request token counts (None if uniform)
+        per_request_draft_token_num: Per-request token counts (None if uniform)
     """
     scores = torch.cat(score_list, dim=1).flatten(1)
     tokens = torch.cat(token_list, dim=1)
@@ -87,7 +87,7 @@ def organize_draft_results(
                 draft_counts = torch.zeros(bs, dtype=torch.long, device=device)
 
         # Step 2: Unified selection - single topk, vectorized split
-        per_request_k = draft_counts + 1  # +1 for verified token
+        per_request_draft_token_num = draft_counts + 1  # +1 for verified token
         max_drafts = int(draft_counts.max().item())
 
         if max_drafts > 0:
@@ -121,7 +121,7 @@ def organize_draft_results(
         top_scores = torch.topk(scores, num_draft_token - 1, dim=-1)
         top_scores_index = torch.sort(top_scores.indices).values
         draft_tokens = torch.gather(tokens, index=top_scores_index, dim=1)
-        per_request_k = None
+        per_request_draft_token_num = None
 
     # Build parent_list
     if len(parents_list) > 1:
@@ -129,7 +129,7 @@ def organize_draft_results(
     else:
         parent_list = torch.empty(bs, 0, device=device)
 
-    return parent_list, top_scores_index, draft_tokens, per_request_k
+    return parent_list, top_scores_index, draft_tokens, per_request_draft_token_num
 
 
 class TreeMaskMode(IntEnum):

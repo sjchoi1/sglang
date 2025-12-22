@@ -24,6 +24,7 @@ class Calibration:
 
     def fit(self, scores: np.ndarray, accepted: np.ndarray):
         """Fit linear regression from collected (cumulative score, accepted) pairs."""
+        assert len(scores) == len(accepted), f"Mismatched lengths: {len(scores)} vs {len(accepted)}"
         if len(scores) < 2:
             return
 
@@ -84,7 +85,6 @@ class PiecewiseLinearLatency:
         self.boundaries: List[int] = []
         self.slopes: List[float] = []
         self.intercepts: List[float] = []
-        self.boundary_latencies: dict = {}  # boundary -> latency
         # Cached tensors for vectorized predict_batch
         self._latency_cache: torch.Tensor = None
         self._cache_device: torch.device = None
@@ -104,28 +104,21 @@ class PiecewiseLinearLatency:
             latencies: corresponding latencies (ms)
             jump_threshold: relative jump to detect boundary (0.15 = 15%)
         """
+        assert len(token_counts) == len(latencies), f"Mismatched lengths: {len(token_counts)} vs {len(latencies)}"
+        if len(token_counts) == 0:
+            return
+
         # Sort by token count
         sorted_pairs = sorted(zip(token_counts, latencies))
         tokens = np.array([p[0] for p in sorted_pairs])
         lats = np.array([p[1] for p in sorted_pairs])
 
-        # Detect boundaries
+        # Detect boundaries (where latency jumps)
         self.boundaries = [int(tokens[0])]
         for i in range(1, len(tokens)):
             if lats[i - 1] > 0 and (lats[i] - lats[i - 1]) / lats[i - 1] > jump_threshold:
                 self.boundaries.append(int(tokens[i]))
         self.boundaries.append(int(tokens[-1]) + 1)
-
-        # Store boundary latencies for fast lookup
-        for b in self.boundaries[:-1]:
-            idx = np.where(tokens == b)[0]
-            if len(idx) > 0:
-                self.boundary_latencies[b] = float(lats[idx[0]])
-            elif b > 0:
-                below = tokens[tokens <= b]
-                if len(below) > 0:
-                    closest_idx = np.argmax(below)
-                    self.boundary_latencies[b] = float(lats[closest_idx])
 
         # Fit linear regression per segment
         self.slopes = []
@@ -148,12 +141,8 @@ class PiecewiseLinearLatency:
             self.intercepts.append(float(intercept))
 
     def predict(self, n: int) -> float:
-        """Predict latency for n tokens."""
-        # Check boundary latencies first (fast path)
-        if n in self.boundary_latencies:
-            return self.boundary_latencies[n]
-
-        # Fall back to piecewise linear
+        """Predict latency for n tokens using piecewise linear model."""
+        # Find segment and use linear regression
         for i in range(len(self.boundaries) - 1):
             if self.boundaries[i] <= n < self.boundaries[i + 1]:
                 return self.slopes[i] * n + self.intercepts[i]
@@ -194,8 +183,6 @@ class PiecewiseLinearLatency:
             boundaries=self.boundaries,
             slopes=self.slopes,
             intercepts=self.intercepts,
-            boundary_latencies_keys=list(self.boundary_latencies.keys()),
-            boundary_latencies_values=list(self.boundary_latencies.values()),
         )
 
     def load(self, path: str):
@@ -203,9 +190,3 @@ class PiecewiseLinearLatency:
         self.boundaries = data["boundaries"].tolist()
         self.slopes = data["slopes"].tolist()
         self.intercepts = data["intercepts"].tolist()
-
-        # Load boundary latencies
-        bl_keys = data.get("boundary_latencies_keys", [])
-        bl_values = data.get("boundary_latencies_values", [])
-        if len(bl_keys) > 0:
-            self.boundary_latencies = {int(k): float(v) for k, v in zip(bl_keys, bl_values)}
