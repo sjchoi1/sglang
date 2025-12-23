@@ -536,6 +536,8 @@ class EAGLEWorker(TpModelWorker):
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
             )
+            # CUDA graphs don't support TileSpec (static batching)
+            per_request_draft_token_num = None
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if (
@@ -573,6 +575,7 @@ class EAGLEWorker(TpModelWorker):
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
+            per_request_draft_token_num=per_request_draft_token_num,
         )
 
         return EagleVerifyInput(
@@ -775,6 +778,9 @@ class EAGLEWorker(TpModelWorker):
         # Record TileSpec profiling data (latency only for now)
         if hasattr(self, 'tile_spec_profiler') and self.tile_spec_profiler is not None:
             num_tokens = spec_info.draft_token.shape[0] if not batch.forward_mode.is_idle() else 0
+            is_profiling = self.tile_spec_profiler.is_profiling()
+            logger.info(f"TileSpec [Verify]: num_tokens={num_tokens}, latency={verify_latency_ms:.2f}ms, "
+                       f"profiling={'yes' if is_profiling else 'no'}, per_request_counts={spec_info.per_request_draft_token_num.tolist() if spec_info.per_request_draft_token_num is not None else 'uniform'}")
             self.tile_spec_profiler.record(
                 num_tokens=num_tokens,
                 latency_ms=verify_latency_ms,

@@ -165,25 +165,26 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         batch.input_ids = self.draft_token
 
-        # Determine draft token counts per request (uniform or per-request)
+        # For TileSpec: use per-request draft counts
+        # For uniform: use scalar draft_token_num (broadcasts to all requests)
         if self.per_request_draft_token_num is not None:
-            draft_counts = self.per_request_draft_token_num
-            draft_counts_cpu = self.per_request_draft_token_num.cpu()
+            draft_token_counts = self.per_request_draft_token_num
+            draft_token_counts_cpu = self.per_request_draft_token_num.cpu()
         else:
-            draft_counts = self.draft_token_num
-            draft_counts_cpu = self.draft_token_num
+            draft_token_counts = self.draft_token_num
+            draft_token_counts_cpu = self.draft_token_num
 
         if page_size == 1:
             batch.out_cache_loc = alloc_token_slots(
                 batch.tree_cache,
-                len(batch.input_ids),
+                len(batch.input_ids),  # Exact size (ragged sum or uniform total)
             )
-            end_offset = batch.seq_lens + draft_counts
+            end_offset = batch.seq_lens + draft_token_counts
         else:
             prefix_lens = batch.seq_lens
             prefix_lens_cpu = batch.seq_lens_cpu
-            end_offset = prefix_lens + draft_counts
-            end_offset_cpu = prefix_lens_cpu + draft_counts_cpu
+            end_offset = prefix_lens + draft_token_counts
+            end_offset_cpu = prefix_lens_cpu + draft_token_counts_cpu
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
@@ -196,7 +197,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 end_offset,
                 end_offset_cpu,
                 last_loc,
-                len(batch.input_ids),
+                len(batch.input_ids),  # Exact size
             )
             self.last_loc = last_loc
 
@@ -229,22 +230,39 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     ):
         device = req_pool_indices.device
         batch_size = len(req_pool_indices)
-        qo_indptr = torch.arange(
-            0,
-            (1 + batch_size) * self.draft_token_num,
-            step=self.draft_token_num,
-            dtype=torch.int32,
-            device=device,
-        )
+
+        # Handle both uniform and per-request draft token counts
+        if self.per_request_draft_token_num is not None:
+            # Ragged case: use actual per-request counts
+            draft_counts = self.per_request_draft_token_num
+            total_draft_tokens = draft_counts.sum().item()
+            # qo_indptr: cumulative offsets for each request
+            qo_indptr = torch.cat([
+                torch.zeros(1, dtype=torch.int32, device=device),
+                draft_counts.cumsum(0).to(torch.int32)
+            ])
+            logger.info(f"TileSpec [AttentionMeta]: Ragged drafts, counts={draft_counts.tolist()}, total={total_draft_tokens}, paged_kernel_lens_before={paged_kernel_lens.tolist()}")
+        else:
+            # Uniform case: all requests have same count
+            draft_counts = self.draft_token_num
+            total_draft_tokens = self.draft_token_num * batch_size
+            qo_indptr = torch.arange(
+                0,
+                (1 + batch_size) * self.draft_token_num,
+                step=self.draft_token_num,
+                dtype=torch.int32,
+                device=device,
+            )
+
         cum_kv_seq_len = torch.zeros(
             (batch_size + 1,), dtype=torch.int32, device=device
         )
 
-        paged_kernel_lens = paged_kernel_lens + self.draft_token_num
+        paged_kernel_lens = paged_kernel_lens + draft_counts
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
         kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * batch_size,
+            paged_kernel_lens_sum + total_draft_tokens,
             dtype=torch.int32,
             device=device,
         )

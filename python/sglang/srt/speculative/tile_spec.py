@@ -333,7 +333,8 @@ class TileSpecProfiler:
 
         total_outliers = sum(len(o) for o in outliers.values())
         logger.info(f"TileSpec: Fitting from {len(self._latency_data)} samples ({total_outliers} outliers removed)")
-        logger.info(f"  Token counts: {token_counts}")
+        logger.info(f"  Token counts: min={min(token_counts)}, max={max(token_counts)}, unique={len(token_counts)}")
+        logger.info(f"  Latency range: {min(latencies):.2f}ms - {max(latencies):.2f}ms")
 
         self.latency_model = PiecewiseLinearLatency()
         self.latency_model.fit(token_counts, latencies)

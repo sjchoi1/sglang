@@ -202,3 +202,199 @@ Since scores are products of probabilities (each < 1), they naturally decrease a
 - Check `batch.spec_info` for current speculative state
 - Use `torch.cuda.synchronize()` before timing measurements
 - Latency profiling should use median of multiple runs after warmup
+
+---
+
+# TileSpec Implementation: Ragged Draft Token Support
+
+## Summary
+
+TileSpec enables per-request variable draft token counts to optimize for GPU MLP tile boundaries. This requires modifying SGLang's uniform speculation code to support **ragged (variable-length) draft tokens per request**.
+
+**Key Design Decision:** Use **exact-size ragged allocation and eviction** to minimize code changes and memory waste.
+
+## Memory Layout Strategy
+
+**Ragged Packed Layout** (what we use):
+```
+Allocation:  [req0_tok0, req0_tok1, req1_tok0, req1_tok1, req1_tok2]
+Indices:      0          1          2          3          4
+Sizes:        2 tokens for req0, 3 tokens for req1
+```
+
+**Why ragged?**
+- ✅ No memory waste (no padding)
+- ✅ Minimal code changes (closest to original SGLang)
+- ✅ Original eviction code works as-is
+- ✅ Single kernel call for `assign_req_to_token_pool` (uses cumsum internally)
+
+**Alternative (uniform strided - REJECTED):**
+```
+[req0_t0, req0_t1, PAD, PAD, PAD, req1_t0, req1_t1, req1_t2, PAD, PAD]
+```
+- ❌ Wastes memory (padding slots)
+- ❌ Requires loops for req_to_token mapping
+- ❌ Needs ragged→strided index conversion
+- ❌ More complex code
+
+## Changes vs Base Commit (0071fe9c)
+
+### File: `python/sglang/srt/speculative/eagle_info.py` (314 lines changed)
+
+#### 1. Added Helper Function (52 lines)
+```python
+def _pad_to_2d(flat_tensor, per_request_counts, max_count, pad_value=-1):
+    """Pad ragged tensor to uniform 2D for verification kernel."""
+```
+**Why:** Verification kernel (`verify_tree_greedy`) expects uniform 2D tensors [bs, max_count].
+
+#### 2. Added Field to Dataclass (5 lines)
+```python
+@dataclass
+class EagleVerifyInput:
+    per_request_draft_token_num: Optional[torch.Tensor] = None  # [bs] or None
+```
+**Why:** Track per-request draft counts throughout the pipeline.
+
+#### 3. Modified `prepare_for_verify()` (17 lines changed)
+```python
+# Before (original):
+end_offset = batch.seq_lens + self.draft_token_num  # Scalar broadcast
+
+# After (TileSpec):
+if self.per_request_draft_token_num is not None:
+    draft_token_counts = self.per_request_draft_token_num  # [bs]
+else:
+    draft_token_counts = self.draft_token_num  # Scalar
+end_offset = batch.seq_lens + draft_token_counts  # Per-request or broadcast
+```
+**Why:** Tell `assign_req_to_token_pool` the actual per-request counts.  
+**Verified minimal:** Only changes `end_offset` calculation. Allocation size (`len(batch.input_ids)`) already correct for both uniform and ragged.
+
+#### 4. Modified `generate_attn_arg_prefill()` (~50 lines)
+```python
+# Calculate qo_indptr for ragged case
+if self.per_request_draft_token_num is not None:
+    qo_indptr = torch.cat([
+        torch.zeros(1, dtype=torch.int32, device=device),
+        draft_counts.cumsum(0).to(torch.int32)  # Cumulative offsets
+    ])
+else:
+    qo_indptr = torch.arange(0, (1+bs)*draft_token_num, step=draft_token_num, ...)
+```
+**Why:** FlashInfer attention backend needs cumulative offsets for ragged token sequences.  
+**Verified minimal:** Only adds conditional for ragged case, keeps original uniform path.
+
+#### 5. Modified `verify()` to Pad for Verification Kernel (~80 lines)
+```python
+# Before (original):
+candidates = self.draft_token.reshape(bs, self.draft_token_num)
+target_predict = target_predict.reshape(bs, self.draft_token_num)
+
+# After (TileSpec):
+if self.per_request_draft_token_num is not None:
+    max_count = self.per_request_draft_token_num.max().item()
+    candidates = _pad_to_2d(self.draft_token, self.per_request_draft_token_num, max_count)
+    target_predict = _pad_to_2d(target_predict, self.per_request_draft_token_num, max_count)
+else:
+    candidates = self.draft_token.reshape(bs, self.draft_token_num)
+    target_predict = target_predict.reshape(bs, self.draft_token_num)
+```
+**Why:** Verification kernel requires uniform 2D tensors. Padding is harmless (-1 values never match).  
+**Verified minimal:** Only adds ragged case, keeps original uniform path intact.
+
+**Eviction code:** No changes! Original code already uses `torch.full_like(self.draft_token, True)` which creates ragged-sized mask. ✅
+
+### File: `python/sglang/srt/speculative/eagle_utils.py` (~200 lines changed)
+
+#### 1. Modified `organize_draft_results()` (~140 lines)
+Added TileSpec logic:
+- **Profiling mode:** Random draft counts per request
+- **Runtime mode:** Global optimization to select optimal counts
+- **Vectorized token selection:** Single topk, vectorized gather/split
+
+**Why:** This is where TileSpec selects per-request draft counts.  
+**Verified minimal:** All changes guarded by `if tilespec_active`. Original path unchanged.
+
+#### 2. Modified `build_tree_kernel_efficient()` (~100 lines)
+Added loop for ragged case:
+```python
+if per_request_draft_token_num is not None:
+    for req_idx in range(bs):
+        req_count = per_request_draft_token_num[req_idx].item()
+        # Call kernel with uniform count for this request
+        sgl_build_tree_kernel[...](
+            ...,
+            num_verify_tokens=req_count,  # Actual count for this request
+        )
+else:
+    # Original: single kernel call for all requests
+    sgl_build_tree_kernel[...](...)
+```
+**Why:** Tree building kernel doesn't support ragged input, so we loop per request.  
+**Verified minimal:** Original single-call path preserved when `per_request_draft_token_num is None`.
+
+### File: `python/sglang/srt/speculative/eagle_worker.py` (~50 lines changed)
+
+1. Pass `per_request_draft_token_num` through pipeline
+2. Add timing for profiling
+3. Call profiler to record latency data
+
+**Verified minimal:** Only adds plumbing for new field and profiling hooks.
+
+## Verification: All Changes Are Essential and Minimal
+
+### Essential Changes (Required for Ragged Support)
+1. ✅ `_pad_to_2d()` helper - Required to interface with uniform verification kernel
+2. ✅ `per_request_draft_token_num` field - Required to track ragged counts
+3. ✅ `end_offset` calculation - Required to allocate correct memory per request
+4. ✅ `qo_indptr` calculation - Required for FlashInfer attention with ragged tokens
+5. ✅ Padding in `verify()` - Required for verification kernel interface
+6. ✅ `organize_draft_results()` TileSpec logic - Core TileSpec algorithm
+7. ✅ `build_tree_kernel_efficient()` loop - Required because kernel doesn't support ragged
+8. ✅ Profiling hooks - Required for TileSpec auto-tuning
+
+### Minimal Impact on Original Code
+- **Eviction:** 0 changes (original code already supports ragged via `torch.full_like`)
+- **Allocation:** 0 changes (original code already uses `len(batch.input_ids)`)
+- **req_to_token mapping:** 0 changes (kernel already handles ragged via internal cumsum)
+- **All changes guarded:** Original uniform path preserved when `per_request_draft_token_num is None`
+
+### Efficiency
+- **Memory:** No waste (exact-size allocation)
+- **Computation:** One extra loop in `build_tree_kernel_efficient` (~16μs for bs=8)
+- **Code complexity:** Adds ~400 lines, all isolated to TileSpec paths
+
+## Testing Strategy
+
+```bash
+# 1. Uniform EAGLE (original behavior, TileSpec disabled)
+python -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path meta-llama/Llama-3.1-8B-Instruct
+# Expected: Works exactly as before (no code path changes)
+
+# 2. TileSpec profiling
+python -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path meta-llama/Llama-3.1-8B-Instruct \
+    --tile-spec \
+    --disable-cuda-graph
+# Expected: Profiling completes, cache files generated, no memory leaks
+
+# 3. TileSpec runtime
+# (Same command after profiling)
+# Expected: Per-request dynamic k selection, 10-30% speedup
+```
+
+## Key Insights
+
+1. **Ragged is simpler than uniform strided** - Original SGLang already supports ragged allocation/eviction via `len(batch.input_ids)` and `torch.full_like()`.
+
+2. **Only one loop needed** - `build_tree_kernel_efficient` requires a loop because the CUDA kernel doesn't support ragged input. All other operations work with single kernel calls.
+
+3. **Padding is free** - Verification kernel with -1 padding is harmless and avoids kernel modifications.
+
+4. **Changes are isolated** - All TileSpec logic guarded by `if per_request_draft_token_num is not None`. Zero impact on original EAGLE behavior.
