@@ -350,6 +350,12 @@ def build_tree_kernel_efficient(
                     req_count,
                     tree_mask_mode,
                 )
+
+            # TileSpec fix: kernel computes local indices (bid=0), convert to global
+            # retrive_index values are used by verify_tree_greedy to fill accept_index
+            global_offset = draft_offsets[req_idx].item()
+            if global_offset > 0:
+                retrive_index[req_idx, :req_count] += global_offset
         logger.info(f"TileSpec [BuildTree]: Loop completed, called kernel {bs} times")
     else:
         # Uniform case: call kernel once with batched inputs (original behavior)
