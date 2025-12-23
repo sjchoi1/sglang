@@ -254,44 +254,118 @@ def build_tree_kernel_efficient(
             (total_verify_tokens,), device=device, dtype=torch.long
         )
 
-    # Prepare per_request_draft_token_num parameter (empty tensor if None)
+    # TileSpec ragged case: loop over requests and call kernel with uniform count each time
     if per_request_draft_token_num is not None:
-        per_request_counts_arg = per_request_draft_token_num
-    else:
-        per_request_counts_arg = torch.empty(0, dtype=torch.long, device=device)
+        # Calculate offsets into flattened buffers
+        draft_offsets = torch.cat([
+            torch.zeros(1, device=device, dtype=torch.long),
+            per_request_draft_token_num.cumsum(0)
+        ])
 
-    if _is_npu:
-        torch.ops.npu.build_tree_kernel_efficient(
-            parent_list.to(dtype=torch.int64),
-            top_scores_index,
-            seq_lens,
-            tree_mask,
-            positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-            tree_mask_mode,
-            per_request_counts_arg,
-        )
+        # Calculate tree_mask offsets (depends on tree_mask_mode)
+        if tree_mask_mode == TreeMaskMode.QLEN_ONLY:
+            # mask_size per request = count^2
+            mask_offsets = torch.cat([
+                torch.zeros(1, device=device, dtype=torch.long),
+                (per_request_draft_token_num ** 2).cumsum(0)
+            ])
+        elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
+            # mask_size per request = count
+            mask_offsets = draft_offsets.clone()
+        elif tree_mask_mode == TreeMaskMode.FULL_MASK:
+            # mask_size per request = seq_len * count + count^2
+            mask_sizes = seq_lens * per_request_draft_token_num + per_request_draft_token_num ** 2
+            mask_offsets = torch.cat([
+                torch.zeros(1, device=device, dtype=torch.long),
+                mask_sizes.cumsum(0)
+            ])
+        else:
+            raise NotImplementedError(f"Invalid tree mask mode: {tree_mask_mode}")
+
+        # Loop over each request and call kernel
+        for req_idx in range(bs):
+            req_count = per_request_draft_token_num[req_idx].item()
+
+            # Slice flattened draft data
+            draft_start = draft_offsets[req_idx].item()
+            draft_end = draft_offsets[req_idx + 1].item()
+
+            # top_scores_index doesn't include verified token, so offset by 1 per request
+            # In flattened layout: [v0, d0_0, ..., v1, d1_0, ...]
+            # top_scores_index refers to draft tokens only: [d0_0, ..., d1_0, ...]
+            scores_start = draft_start - req_idx if req_idx > 0 else 0
+            scores_end = draft_end - (req_idx + 1)
+            req_top_scores = top_scores_index[scores_start:scores_end] if scores_end > scores_start else torch.empty(0, dtype=torch.long, device=device)
+
+            # Slice output buffers
+            req_positions = positions[draft_start:draft_end]
+            mask_start = mask_offsets[req_idx].item()
+            mask_end = mask_offsets[req_idx + 1].item()
+            req_tree_mask = tree_mask[mask_start:mask_end]
+
+            # Call kernel with bs=1 and uniform count
+            if _is_npu:
+                torch.ops.npu.build_tree_kernel_efficient(
+                    parent_list[req_idx:req_idx+1].to(dtype=torch.int64),
+                    req_top_scores,
+                    seq_lens[req_idx:req_idx+1],
+                    req_tree_mask,
+                    req_positions,
+                    retrive_index[req_idx:req_idx+1, :req_count],
+                    retrive_next_token[req_idx:req_idx+1, :req_count],
+                    retrive_next_sibling[req_idx:req_idx+1, :req_count],
+                    topk,
+                    spec_steps,
+                    req_count,
+                    tree_mask_mode,
+                )
+            else:
+                sgl_build_tree_kernel_efficient(
+                    parent_list[req_idx:req_idx+1],
+                    req_top_scores,
+                    seq_lens[req_idx:req_idx+1],
+                    req_tree_mask,
+                    req_positions,
+                    retrive_index[req_idx:req_idx+1, :req_count],
+                    retrive_next_token[req_idx:req_idx+1, :req_count],
+                    retrive_next_sibling[req_idx:req_idx+1, :req_count],
+                    topk,
+                    spec_steps,
+                    req_count,
+                    tree_mask_mode,
+                )
     else:
-        sgl_build_tree_kernel_efficient(
-            parent_list,
-            top_scores_index,
-            seq_lens,
-            tree_mask,
-            positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-            tree_mask_mode,
-            per_request_counts_arg,
-        )
+        # Uniform case: call kernel once with batched inputs (original behavior)
+        if _is_npu:
+            torch.ops.npu.build_tree_kernel_efficient(
+                parent_list.to(dtype=torch.int64),
+                top_scores_index,
+                seq_lens,
+                tree_mask,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                topk,
+                spec_steps,
+                num_verify_tokens,
+                tree_mask_mode,
+            )
+        else:
+            sgl_build_tree_kernel_efficient(
+                parent_list,
+                top_scores_index,
+                seq_lens,
+                tree_mask,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                topk,
+                spec_steps,
+                num_verify_tokens,
+                tree_mask_mode,
+            )
     return (
         tree_mask,
         positions,
