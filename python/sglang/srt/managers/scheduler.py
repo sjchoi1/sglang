@@ -2403,7 +2403,10 @@ class Scheduler(
             if self.tile_spec_profiler is not None and self.tile_spec_profiler.is_profiling():
                 logger.info("TileSpec: Received finish profiling signal")
                 self.tile_spec_profiler.finish_profiling()
-            return SetInternalStateReqOutput(success=True)
+            return SetInternalStateReqOutput(
+                updated=True,
+                server_args=vars(get_global_server_args()),
+            )
 
         args_allow_update = set(
             [

@@ -547,7 +547,7 @@ class EAGLEWorker(TpModelWorker):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
-            parent_list, top_scores_index, draft_tokens, per_request_draft_token_num = self.draft_forward(
+            parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores = self.draft_forward(
                 forward_batch
             )
 
@@ -578,6 +578,17 @@ class EAGLEWorker(TpModelWorker):
             per_request_draft_token_num=per_request_draft_token_num,
         )
 
+        # Flatten selected_scores for TileSpec calibration
+        if selected_scores is not None:
+            if isinstance(selected_scores, list):
+                # TileSpec ragged case: list of tensors per request
+                selected_scores_flat = torch.cat(selected_scores) if any(s.numel() > 0 for s in selected_scores) else None
+            else:
+                # Uniform case: [bs, n_drafts] tensor
+                selected_scores_flat = selected_scores.flatten()
+        else:
+            selected_scores_flat = None
+
         return EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -593,6 +604,7 @@ class EAGLEWorker(TpModelWorker):
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             per_request_draft_token_num=per_request_draft_token_num,
+            selected_scores=selected_scores_flat,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -671,7 +683,7 @@ class EAGLEWorker(TpModelWorker):
                 # Runtime: get calibrated models
                 latency_model, calibration = self.tile_spec_profiler.get_models()
 
-        parent_list, top_scores_index, draft_tokens, per_request_draft_token_num = organize_draft_results(
+        parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores = organize_draft_results(
             score_list,
             token_list,
             parents_list,
@@ -681,7 +693,7 @@ class EAGLEWorker(TpModelWorker):
             is_tilespec_profiling=is_tilespec_profiling,
         )
 
-        return parent_list, top_scores_index, draft_tokens, per_request_draft_token_num
+        return parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores
 
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker
@@ -775,17 +787,14 @@ class EAGLEWorker(TpModelWorker):
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
 
-        # Record TileSpec profiling data (latency only for now)
+        # Record TileSpec profiling data
         if hasattr(self, 'tile_spec_profiler') and self.tile_spec_profiler is not None:
             num_tokens = spec_info.draft_token.shape[0] if not batch.forward_mode.is_idle() else 0
-            is_profiling = self.tile_spec_profiler.is_profiling()
-            logger.info(f"TileSpec [Verify]: num_tokens={num_tokens}, latency={verify_latency_ms:.2f}ms, "
-                       f"profiling={'yes' if is_profiling else 'no'}, per_request_counts={spec_info.per_request_draft_token_num.tolist() if spec_info.per_request_draft_token_num is not None else 'uniform'}")
             self.tile_spec_profiler.record(
                 num_tokens=num_tokens,
                 latency_ms=verify_latency_ms,
-                scores=None,  # TODO: Add score tracking
-                accepted=None,  # TODO: Add accepted mask
+                scores=getattr(spec_info, 'selected_scores', None),
+                accepted=getattr(spec_info, '_accepted_mask', None),
             )
 
         # Prepare the batch for the next draft forwards.

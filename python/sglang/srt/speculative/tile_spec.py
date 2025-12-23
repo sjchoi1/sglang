@@ -764,23 +764,12 @@ def tile_spec_warmup(
         logger.warning(f"TileSpec: finish_fn() failed: {e}")
 
     # Wait for profiling to complete via polling
-    logger.info("TileSpec: Polling for profiling completion...")
-    start_wait = time.time()
-    max_wait = 120  # Maximum 2 minutes wait
-
+    logger.info("TileSpec: Waiting for profiling completion...")
     while True:
-        wait_duration = time.time() - start_wait
-        if wait_duration > max_wait:
-            logger.warning(f"TileSpec: Profiling did not complete after {max_wait}s, giving up")
-            return
-
         try:
-            is_ready = check_ready_fn()
-            logger.info(f"TileSpec: check_ready_fn() = {is_ready} (waited {wait_duration:.1f}s)")
-            if is_ready:
-                logger.info(f"TileSpec: Profiling complete (waited {wait_duration:.1f}s)")
+            if check_ready_fn():
+                logger.info("TileSpec: Profiling complete")
                 return
         except Exception as e:
             logger.warning(f"TileSpec: check_ready_fn() failed: {e}")
-
         time.sleep(1.0)

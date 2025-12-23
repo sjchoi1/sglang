@@ -125,6 +125,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     # Tensor [bs] = per-request counts (can vary)
     per_request_draft_token_num: Optional[torch.Tensor] = None
 
+    # Selected scores for TileSpec calibration
+    # Flattened tensor [total_tokens] of cumulative path scores
+    selected_scores: Optional[torch.Tensor] = None
+
     # Shape info for padding
     num_tokens_per_batch: int = -1
 
@@ -241,7 +245,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 torch.zeros(1, dtype=torch.int32, device=device),
                 draft_counts.cumsum(0).to(torch.int32)
             ])
-            logger.info(f"TileSpec [AttentionMeta]: Ragged drafts, counts={draft_counts.tolist()}, total={total_draft_tokens}, paged_kernel_lens_before={paged_kernel_lens.tolist()}")
         else:
             # Uniform case: all requests have same count
             draft_counts = self.draft_token_num
@@ -568,6 +571,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
+
+        # Build accepted mask for TileSpec calibration (before flattening accept_index)
+        if self.selected_scores is not None:
+            total_tokens = self.draft_token.shape[0]
+            accepted_mask = torch.zeros(total_tokens, dtype=torch.bool, device=batch.device)
+            valid_indices = accept_index[accept_index != -1]
+            accepted_mask[valid_indices] = True
+            self._accepted_mask = accepted_mask
 
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them

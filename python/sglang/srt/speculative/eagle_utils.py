@@ -59,7 +59,6 @@ def organize_draft_results(
         if is_tilespec_profiling:
             # Profiling: random counts in [0, n_cand] per request (reject all to accept all)
             draft_counts = torch.randint(0, n_cand + 1, (bs,), device=device, dtype=torch.long)
-            logger.info(f"TileSpec [Profiling]: bs={bs}, draft_counts={draft_counts.tolist()}, uniform_would_be={num_draft_token-1}")
         else:
             # Runtime: optimal counts from global E/L optimization
             probs = calibration.predict(scores)
@@ -90,25 +89,16 @@ def organize_draft_results(
             else:
                 draft_counts = torch.zeros(bs, dtype=torch.long, device=device)
 
-            logger.info(f"TileSpec [Runtime]: bs={bs}, total_drafts={total}, draft_counts={draft_counts.tolist()}, "
-                       f"expected_throughput={expected_throughput.max().item():.2f}, uniform_would_be={num_draft_token-1}")
-
         # Step 2: Unified selection - single topk, vectorized split
         per_request_draft_token_num = draft_counts + 1  # +1 for verified token
         max_drafts = int(draft_counts.max().item())
 
-        # Edge case: if all draft counts are 0, fall back to uniform to avoid kernel issues
-        if max_drafts == 0:
-            logger.warning(f"TileSpec: All draft_counts=0, falling back to uniform selection")
-            per_request_draft_token_num = None
-            top_scores = torch.topk(scores, num_draft_token - 1, dim=-1)
-            top_scores_index = torch.sort(top_scores.indices).values
-            draft_tokens = torch.gather(tokens, index=top_scores_index, dim=1)
-        elif max_drafts > 0:
+        if max_drafts > 0:
             # One topk for all requests
             top_k_result = torch.topk(scores, max_drafts, dim=-1)
             top_indices = torch.sort(top_k_result.indices, dim=-1).values  # [bs, max_drafts]
             top_tokens = torch.gather(tokens, dim=1, index=top_indices)  # [bs, max_drafts]
+            top_scores_values = torch.gather(scores, dim=1, index=top_indices)  # [bs, max_drafts]
 
             # Vectorized slicing
             total_drafts = int(draft_counts.sum().item())
@@ -121,20 +111,24 @@ def organize_draft_results(
             # Gather from topk results
             all_indices = top_indices[request_indices, local_indices]
             all_tokens = top_tokens[request_indices, local_indices]
+            all_scores = top_scores_values[request_indices, local_indices]
 
             # Split into lists
             sizes = draft_counts.tolist()
             top_scores_index = list(torch.split(all_indices, sizes))
             draft_tokens = list(torch.split(all_tokens, sizes))
+            selected_scores = list(torch.split(all_scores, sizes))
         else:
             top_scores_index = [torch.empty(0, dtype=torch.long, device=device) for _ in range(bs)]
             draft_tokens = [torch.empty(0, dtype=tokens.dtype, device=device) for _ in range(bs)]
+            selected_scores = [torch.empty(0, dtype=scores.dtype, device=device) for _ in range(bs)]
 
     else:
         # Original EAGLE: uniform selection
         top_scores = torch.topk(scores, num_draft_token - 1, dim=-1)
         top_scores_index = torch.sort(top_scores.indices).values
         draft_tokens = torch.gather(tokens, index=top_scores_index, dim=1)
+        selected_scores = torch.gather(scores, dim=1, index=top_scores_index)
         per_request_draft_token_num = None
         logger.debug(f"TileSpec [Disabled]: uniform bs={bs}, draft_per_req={num_draft_token-1}")
 
@@ -144,7 +138,7 @@ def organize_draft_results(
     else:
         parent_list = torch.empty(bs, 0, device=device)
 
-    return parent_list, top_scores_index, draft_tokens, per_request_draft_token_num
+    return parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores
 
 
 class TreeMaskMode(IntEnum):
@@ -271,7 +265,6 @@ def build_tree_kernel_efficient(
 
     # TileSpec ragged case: loop over requests and call kernel with uniform count each time
     if per_request_draft_token_num is not None:
-        logger.info(f"TileSpec [BuildTree]: Using loop for ragged drafts, bs={bs}, counts={per_request_draft_token_num.tolist()}")
         # Calculate offsets into flattened buffers
         draft_offsets = torch.cat([
             torch.zeros(1, device=device, dtype=torch.long),
@@ -356,7 +349,6 @@ def build_tree_kernel_efficient(
             global_offset = draft_offsets[req_idx].item()
             if global_offset > 0:
                 retrive_index[req_idx, :req_count] += global_offset
-        logger.info(f"TileSpec [BuildTree]: Loop completed, called kernel {bs} times")
     else:
         # Uniform case: call kernel once with batched inputs (original behavior)
         logger.debug(f"TileSpec [BuildTree]: Using uniform path, bs={bs}, draft_per_req={num_verify_tokens}")

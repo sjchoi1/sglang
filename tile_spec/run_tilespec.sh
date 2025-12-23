@@ -2,7 +2,6 @@
 # Run sglang with tile-spec enabled (chain-based for profiling)
 
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
-export CUDA_LAUNCH_BLOCKING=1
 
 sglang serve --model-path meta-llama/Llama-3.1-8B-Instruct \
     --speculative-algorithm EAGLE3 \
