@@ -47,11 +47,16 @@ _original_log_levels = {}
 # ==============================================================================
 
 class Calibration:
-    """Maps cumulative draft scores to acceptance probability using linear regression."""
+    """
+    Maps cumulative draft scores to acceptance probability using linear regression.
+
+    Note: EAGLE/EAGLE3 don't need calibration (score ≈ P(accept) directly).
+    This class is kept for Draft LM and other methods that may need calibration.
+    """
 
     def __init__(self):
         # Linear regression: P(accept) = slope * score + intercept
-        self.slope = 1.0  # default: identity-ish mapping
+        self.slope = 1.0  # default: identity mapping
         self.intercept = 0.0
         self._slope_tensor = None
         self._intercept_tensor = None
@@ -124,12 +129,16 @@ class PiecewiseLinearLatency:
         self._latency_cache: torch.Tensor = None
         self._cache_device: torch.device = None
         self._cache_size: int = 0
+        # Precomputed tensors (device-specific caches)
+        self._boundaries_tensors: dict = {}
+        self._slopes_tensors: dict = {}
+        self._intercepts_tensors: dict = {}
 
     def fit(
         self,
         token_counts: List[int],
         latencies: List[float],
-        jump_threshold: float = 0.15,
+        jump_threshold: float = 0.1,
     ):
         """
         Fit piecewise linear model from measurements.
@@ -137,7 +146,7 @@ class PiecewiseLinearLatency:
         Args:
             token_counts: list of token counts profiled
             latencies: corresponding latencies (ms)
-            jump_threshold: relative jump to detect boundary (0.15 = 15%)
+            jump_threshold: relative jump to detect boundary (0.05 = 5%)
         """
         assert len(token_counts) == len(latencies), f"Mismatched lengths: {len(token_counts)} vs {len(latencies)}"
         if len(token_counts) == 0:
@@ -187,6 +196,26 @@ class PiecewiseLinearLatency:
             return self.slopes[-1] * n + self.intercepts[-1]
         return 1.0  # fallback
 
+    def _get_tensors_for_device(self, device: torch.device):
+        """Get or create precomputed tensors for the given device."""
+        device_key = str(device)
+        if device_key not in self._boundaries_tensors:
+            # Precompute tensors for this device
+            self._boundaries_tensors[device_key] = torch.tensor(
+                self.boundaries[1:], dtype=torch.float32, device=device
+            )
+            self._slopes_tensors[device_key] = torch.tensor(
+                self.slopes, dtype=torch.float32, device=device
+            )
+            self._intercepts_tensors[device_key] = torch.tensor(
+                self.intercepts, dtype=torch.float32, device=device
+            )
+        return (
+            self._boundaries_tensors[device_key],
+            self._slopes_tensors[device_key],
+            self._intercepts_tensors[device_key],
+        )
+
     def predict_batch(self, max_tokens: int, device: torch.device) -> torch.Tensor:
         """
         Get latencies for token counts 1..max_tokens as a tensor (cached).
@@ -200,10 +229,26 @@ class PiecewiseLinearLatency:
             self._cache_size >= max_tokens):
             return self._latency_cache[:max_tokens]
 
-        # Build latency lookup table
-        latencies = torch.empty(max_tokens, dtype=torch.float32, device=device)
-        for i in range(1, max_tokens + 1):
-            latencies[i - 1] = self.predict(i)
+        # Edge case: no boundaries fitted
+        if not self.boundaries or not self.slopes:
+            latencies = torch.ones(max_tokens, dtype=torch.float32, device=device)
+            self._latency_cache = latencies
+            self._cache_device = device
+            self._cache_size = max_tokens
+            return latencies
+
+        # Get precomputed tensors for this device
+        boundaries_tensor, slopes_tensor, intercepts_tensor = self._get_tensors_for_device(device)
+
+        # Vectorized latency computation
+        token_range = torch.arange(1, max_tokens + 1, dtype=torch.float32, device=device)
+
+        # Find segment index for each token using searchsorted
+        segment_indices = torch.searchsorted(boundaries_tensor, token_range, right=False)
+        segment_indices = segment_indices.clamp(0, len(self.slopes) - 1)
+
+        # Vectorized linear interpolation: latency = slope * tokens + intercept
+        latencies = slopes_tensor[segment_indices] * token_range + intercepts_tensor[segment_indices]
 
         # Cache for reuse
         self._latency_cache = latencies
@@ -225,6 +270,13 @@ class PiecewiseLinearLatency:
         self.boundaries = data["boundaries"].tolist()
         self.slopes = data["slopes"].tolist()
         self.intercepts = data["intercepts"].tolist()
+        # Clear tensor caches (will be recreated on demand)
+        self._boundaries_tensors.clear()
+        self._slopes_tensors.clear()
+        self._intercepts_tensors.clear()
+        self._latency_cache = None
+        self._cache_device = None
+        self._cache_size = 0
 
 
 # ==============================================================================
@@ -246,27 +298,21 @@ class TileSpecProfiler:
         self._calibration_data: List[Tuple[float, bool]] = []
 
         self.latency_model: Optional[PiecewiseLinearLatency] = None
-        self.calibration: Optional[Calibration] = None
         self._load_cache()
 
     def _load_cache(self) -> bool:
-        """Load models from cache."""
+        """Load latency model from cache."""
         latency_path = self.cache_dir / "latency_model.npz"
         if not latency_path.exists():
             return False
         try:
             self.latency_model = PiecewiseLinearLatency()
             self.latency_model.load(str(latency_path))
-            self.calibration = Calibration()
-            calib_path = self.cache_dir / "calibration.npz"
-            if calib_path.exists():
-                self.calibration.load(str(calib_path))
             logger.info(f"TileSpec: Loaded from cache, boundaries={self.latency_model.boundaries}")
             return True
         except Exception as e:
             logger.warning(f"Cache load failed: {e}")
             self.latency_model = None
-            self.calibration = None
             return False
 
     def needs_profiling(self) -> bool:
@@ -275,8 +321,9 @@ class TileSpecProfiler:
     def is_profiling(self) -> bool:
         return self._profiling
 
-    def get_models(self) -> Tuple[Optional[PiecewiseLinearLatency], Optional[Calibration]]:
-        return self.latency_model, self.calibration
+    def get_latency_model(self) -> Optional[PiecewiseLinearLatency]:
+        """Get the latency model (calibration not needed - scores are used directly)."""
+        return self.latency_model
 
     def start_profiling(self):
         """Start collecting latency data."""
@@ -339,18 +386,14 @@ class TileSpecProfiler:
         self.latency_model = PiecewiseLinearLatency()
         self.latency_model.fit(token_counts, latencies)
 
-        # Fit calibration from collected data
-        self.calibration = Calibration()
+        # Note: Calibration is not needed - scores directly represent P(accept)
+        # We still collect data for visualization to prove this relationship
         if self._calibration_data:
-            cal_scores = np.array([s for s, _ in self._calibration_data])
-            cal_accepted = np.array([a for _, a in self._calibration_data])
-            self.calibration.fit(cal_scores, cal_accepted)
-            logger.info(f"  Calibration: {len(self._calibration_data)} samples")
+            logger.info(f"  Calibration data: {len(self._calibration_data)} samples (used for visualization only)")
 
         # Save cache
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.latency_model.save(str(self.cache_dir / "latency_model.npz"))
-        self.calibration.save(str(self.cache_dir / "calibration.npz"))
 
         # Save raw data to CSV files
         self._save_csv_data(by_tokens_clean, outliers)
@@ -417,21 +460,13 @@ class TileSpecProfiler:
         # 1. Latency Model Plot
         self._plot_latency_model(token_counts, latencies, by_tokens_clean, outliers, plots_dir)
 
-        # 2. Calibration Plot
-        if self._calibration_data:
-            logger.info(f"TileSpec: Generating calibration plots ({len(self._calibration_data)} samples)...")
-            self._plot_calibration(plots_dir)
-            self._plot_calibration_accuracy(plots_dir)
-        else:
-            logger.warning("TileSpec: No calibration data - skipping calibration plots")
-
-        # 3. Token Distribution Plot
-        self._plot_token_distribution(by_tokens_clean, plots_dir)
+        # 2. Score vs Acceptance Plot (proves score ≈ P(accept), no calibration needed)
+        self._plot_calibration(plots_dir)
 
         logger.info(f"TileSpec: Saved visualizations to {plots_dir}")
 
     def _plot_latency_model(self, token_counts, latencies, by_tokens_clean, outliers, plots_dir):
-        """Plot latency model with raw samples, fitted model, and boundaries."""
+        """Plot latency model with raw samples and fitted model."""
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(10, 6))
@@ -444,15 +479,12 @@ class TileSpecProfiler:
             all_lats.extend(lat)
         ax.scatter(all_tokens, all_lats, alpha=0.3, s=20, label='Raw samples')
 
-        # Plot aggregated medians
-        ax.plot(token_counts, latencies, 'o-', linewidth=2, markersize=8, label='Median latency')
-
         # Plot fitted piecewise model
         if self.latency_model:
             max_tokens = max(token_counts)
             fit_x = np.arange(1, max_tokens + 1)
             fit_y = [self.latency_model.predict(n) for n in fit_x]
-            ax.plot(fit_x, fit_y, '--', linewidth=1.5, alpha=0.7, label='Fitted model')
+            ax.plot(fit_x, fit_y, 'r-', linewidth=2, label='Fitted model')
 
             # Mark tile boundaries
             for boundary in self.latency_model.boundaries:
@@ -470,137 +502,66 @@ class TileSpecProfiler:
         plt.close()
 
     def _plot_calibration(self, plots_dir):
-        """Plot calibration curve: score vs P(accept)."""
+        """Plot score vs P(accept) with identity line and distribution."""
         import matplotlib.pyplot as plt
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax1 = plt.subplots(figsize=(10, 6))
 
         # Bin scores and compute acceptance rate
         cal_scores = np.array([s for s, _ in self._calibration_data])
         cal_accepted = np.array([a for _, a in self._calibration_data])
 
-        # Create bins
-        n_bins = 50
-        bins = np.linspace(cal_scores.min(), cal_scores.max(), n_bins)
+        # Create 20 bins of 0.05 width each (0 to 1)
+        n_bins = 20
+        bin_width = 0.05
+        bins = np.linspace(0, 1, n_bins + 1)
         bin_indices = np.digitize(cal_scores, bins)
 
         bin_centers = []
         acceptance_rates = []
-        for i in range(1, len(bins)):
-            mask = bin_indices == i
-            if mask.sum() > 0:
-                bin_centers.append((bins[i-1] + bins[i]) / 2)
-                acceptance_rates.append(cal_accepted[mask].mean())
-
-        # Plot empirical acceptance rate
-        ax.scatter(bin_centers, acceptance_rates, alpha=0.6, s=30, label='Empirical')
-
-        # Plot fitted calibration curve
-        if self.calibration:
-            score_range = np.linspace(cal_scores.min(), cal_scores.max(), 200)
-            score_tensor = torch.tensor(score_range, dtype=torch.float32)
-            fitted_probs = self.calibration.predict(score_tensor).cpu().numpy()
-            ax.plot(score_range, fitted_probs, '-', linewidth=2, label='Fitted model')
-
-        ax.set_xlabel('Cumulative Draft Score', fontsize=12)
-        ax.set_ylabel('P(Accept)', fontsize=12)
-        ax.set_title('TileSpec Calibration Curve', fontsize=14, fontweight='bold')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        plt.savefig(plots_dir / 'calibration.png', dpi=150)
-        plt.close()
-
-    def _plot_calibration_accuracy(self, plots_dir):
-        """Plot calibration accuracy: predicted P(accept) vs actual P(accept)."""
-        import matplotlib.pyplot as plt
-
-        if not self.calibration:
-            return
-
-        fig, ax = plt.subplots(figsize=(10, 6))
-
-        # Get scores and actual acceptance
-        cal_scores = np.array([s for s, _ in self._calibration_data])
-        cal_accepted = np.array([a for _, a in self._calibration_data])
-
-        # Get predicted probabilities from fitted model
-        score_tensor = torch.tensor(cal_scores, dtype=torch.float32)
-        predicted_probs = self.calibration.predict(score_tensor).cpu().numpy()
-
-        # Bin predicted probabilities and compute actual acceptance rate
-        n_bins = 20
-        bins = np.linspace(0, 1, n_bins + 1)
-        bin_indices = np.digitize(predicted_probs, bins)
-
-        bin_predicted = []
-        bin_actual = []
         bin_counts = []
         for i in range(1, len(bins)):
             mask = bin_indices == i
-            if mask.sum() >= 5:  # At least 5 samples per bin
-                bin_predicted.append((bins[i-1] + bins[i]) / 2)
-                bin_actual.append(cal_accepted[mask].mean())
-                bin_counts.append(mask.sum())
+            bin_centers.append((bins[i-1] + bins[i]) / 2)
+            bin_counts.append(mask.sum())
+            if mask.sum() > 0:
+                acceptance_rates.append(cal_accepted[mask].mean())
+            else:
+                acceptance_rates.append(0)
 
-        # Plot calibration accuracy with point size showing sample count
-        if bin_predicted:
-            sizes = [min(c / 5, 200) for c in bin_counts]  # Scale sizes
-            ax.scatter(bin_predicted, bin_actual, s=sizes, alpha=0.6, label='Binned data')
+        # Plot empirical acceptance rate as bar graph
+        ax1.bar(bin_centers, acceptance_rates, width=bin_width * 0.8, alpha=0.7,
+               color='steelblue', edgecolor='black', linewidth=0.5, label='P(Accept)')
 
-        # Plot perfect calibration line
-        ax.plot([0, 1], [0, 1], 'r--', linewidth=2, label='Perfect calibration')
+        # Plot identity line (0,0) to (1,1) - proves score ≈ P(accept)
+        ax1.plot([0, 1], [0, 1], 'r-', linewidth=2, label='Identity (y=x)')
 
-        # Calculate calibration metrics
-        if bin_predicted:
-            bin_predicted_arr = np.array(bin_predicted)
-            bin_actual_arr = np.array(bin_actual)
-            bin_counts_arr = np.array(bin_counts)
+        ax1.set_xlabel('Cumulative Draft Score', fontsize=12)
+        ax1.set_ylabel('P(Accept)', fontsize=12, color='steelblue')
+        ax1.set_xlim(-0.05, 1.05)
+        ax1.set_ylim(0, 1.05)
+        ax1.tick_params(axis='y', labelcolor='steelblue')
 
-            # Mean Absolute Error
-            mae = np.mean(np.abs(bin_predicted_arr - bin_actual_arr))
+        # Secondary y-axis for distribution (normalized to sum=1)
+        ax2 = ax1.twinx()
+        total_samples = sum(bin_counts)
+        bin_distribution = [c / total_samples if total_samples > 0 else 0 for c in bin_counts]
+        ax2.bar(bin_centers, bin_distribution, width=bin_width * 0.4, alpha=0.5,
+               color='green', edgecolor='darkgreen', linewidth=0.5, label='Distribution')
+        ax2.set_ylabel('Distribution', fontsize=12, color='green')
+        ax2.tick_params(axis='y', labelcolor='green')
 
-            # Expected Calibration Error (ECE) - weighted by sample count
-            ece = np.sum(bin_counts_arr * np.abs(bin_predicted_arr - bin_actual_arr)) / np.sum(bin_counts_arr)
+        # Combined legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
 
-            # Display metrics
-            metrics_text = f'MAE: {mae:.4f}\nECE: {ece:.4f}'
-            ax.text(0.05, 0.95, metrics_text,
-                   transform=ax.transAxes, fontsize=11,
-                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-        ax.set_xlabel('Predicted P(Accept)', fontsize=12)
-        ax.set_ylabel('Actual P(Accept)', fontsize=12)
-        ax.set_title('Calibration Accuracy', fontsize=14, fontweight='bold')
-        ax.set_xlim(-0.05, 1.05)
-        ax.set_ylim(-0.05, 1.05)
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax1.set_title('Draft Confidence vs Acceptance Probability', fontsize=14, fontweight='bold')
+        ax1.grid(True, alpha=0.3, axis='y')
 
         plt.tight_layout()
-        plt.savefig(plots_dir / 'calibration_accuracy.png', dpi=150)
+        plt.savefig(plots_dir / 'score_acceptance.png', dpi=150)
         plt.close()
-
-    def _plot_token_distribution(self, by_tokens, plots_dir):
-        """Plot distribution of token counts profiled."""
-        import matplotlib.pyplot as plt
-
-        fig, ax = plt.subplots(figsize=(10, 6))
-
-        token_counts = sorted(by_tokens.keys())
-        sample_counts = [len(by_tokens[t]) for t in token_counts]
-
-        ax.bar(token_counts, sample_counts, alpha=0.7, edgecolor='black')
-        ax.set_xlabel('Total Tokens', fontsize=12)
-        ax.set_ylabel('Number of Samples', fontsize=12)
-        ax.set_title('Profiling Coverage', fontsize=14, fontweight='bold')
-        ax.grid(True, alpha=0.3, axis='y')
-
-        plt.tight_layout()
-        plt.savefig(plots_dir / 'token_distribution.png', dpi=150)
-        plt.close()
-
 
 # ==============================================================================
 # Helper Functions

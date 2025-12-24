@@ -533,11 +533,14 @@ class EAGLEWorker(TpModelWorker):
             forward_batch
         )
         if can_cuda_graph:
-            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
-                forward_batch
-            )
-            # CUDA graphs don't support TileSpec (static batching)
-            per_request_draft_token_num = None
+            result = self.cuda_graph_runner.replay(forward_batch)
+            # Handle both 3-value and 5-value outputs from CUDA graph
+            if len(result) == 5:
+                parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores = result
+            else:
+                parent_list, top_scores_index, draft_tokens = result
+                per_request_draft_token_num = None
+                selected_scores = None
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if (
@@ -673,25 +676,31 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-        # Get TileSpec profiling state and models
+        # Get TileSpec profiling state and latency model
         is_tilespec_profiling = False
-        calibration = None
         latency_model = None
         if hasattr(self, 'tile_spec_profiler') and self.tile_spec_profiler is not None:
             is_tilespec_profiling = self.tile_spec_profiler.is_profiling()
             if not is_tilespec_profiling:
-                # Runtime: get calibrated models
-                latency_model, calibration = self.tile_spec_profiler.get_models()
+                # Runtime: get latency model (no calibration needed - scores used directly)
+                latency_model = self.tile_spec_profiler.get_latency_model()
 
-        parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores = organize_draft_results(
+        result = organize_draft_results(
             score_list,
             token_list,
             parents_list,
             self.speculative_num_draft_tokens,
-            calibration=calibration,
             latency_model=latency_model,
             is_tilespec_profiling=is_tilespec_profiling,
         )
+
+        # Handle both 3-value (uniform) and 5-value (TileSpec) returns
+        if len(result) == 5:
+            parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores = result
+        else:
+            parent_list, top_scores_index, draft_tokens = result
+            per_request_draft_token_num = None
+            selected_scores = None
 
         return parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores
 

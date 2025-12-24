@@ -1,4 +1,3 @@
-import logging
 import math
 from enum import IntEnum
 from typing import List, Optional
@@ -6,8 +5,6 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.utils import is_cuda, is_hip, is_npu
-
-logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -24,7 +21,6 @@ def organize_draft_results(
     token_list: List[torch.Tensor],
     parents_list: List[torch.Tensor],
     num_draft_token: int,
-    calibration=None,
     latency_model=None,
     is_tilespec_profiling: bool = False,
 ):
@@ -36,7 +32,6 @@ def organize_draft_results(
         token_list: List of token tensors from each draft step
         parents_list: List of parent tensors from each draft step
         num_draft_token: Maximum draft tokens (always int)
-        calibration: TileSpec Calibration object (optional)
         latency_model: TileSpec PiecewiseLinearLatency object (optional)
         is_tilespec_profiling: Whether TileSpec is in profiling mode
 
@@ -45,6 +40,10 @@ def organize_draft_results(
         top_scores_index: Selected token indices (tensor or list)
         draft_tokens: Selected tokens (tensor or list)
         per_request_draft_token_num: Per-request token counts (None if uniform)
+
+    Note:
+        Scores are used directly as P(accept) - no calibration needed.
+        Empirically validated: cumulative draft score ≈ acceptance probability.
     """
     scores = torch.cat(score_list, dim=1).flatten(1)
     tokens = torch.cat(token_list, dim=1)
@@ -52,16 +51,23 @@ def organize_draft_results(
     device = scores.device
 
     # Check if TileSpec is active
-    tilespec_active = is_tilespec_profiling or (calibration is not None and latency_model is not None)
+    tilespec_active = is_tilespec_profiling or (latency_model is not None)
 
     if tilespec_active:
         # Step 1: Determine draft counts per request
         if is_tilespec_profiling:
-            # Profiling: random counts in [0, n_cand] per request (reject all to accept all)
-            draft_counts = torch.randint(0, n_cand + 1, (bs,), device=device, dtype=torch.long)
+            # Profiling: mix random and full draft counts
+            # - Random (50%): granular token counts for exact boundary detection
+            # - Full (50%): high token count coverage for 192, 256+ boundaries
+            if torch.rand(1, device=device).item() < 0.5:
+                draft_counts = torch.randint(0, n_cand + 1, (bs,), device=device, dtype=torch.long)
+            else:
+                draft_counts = torch.full((bs,), n_cand, device=device, dtype=torch.long)
         else:
             # Runtime: optimal counts from global E/L optimization
-            probs = calibration.predict(scores)
+            # Use scores directly as P(accept) - no calibration needed
+            # (empirically validated: cumulative draft score ≈ acceptance probability)
+            probs = scores
             sorted_probs, sorted_indices = torch.sort(probs.flatten(), descending=True)
             cum_E = torch.cumsum(sorted_probs, dim=0)
 
@@ -98,7 +104,6 @@ def organize_draft_results(
             top_k_result = torch.topk(scores, max_drafts, dim=-1)
             top_indices = torch.sort(top_k_result.indices, dim=-1).values  # [bs, max_drafts]
             top_tokens = torch.gather(tokens, dim=1, index=top_indices)  # [bs, max_drafts]
-            top_scores_values = torch.gather(scores, dim=1, index=top_indices)  # [bs, max_drafts]
 
             # Vectorized slicing
             total_drafts = int(draft_counts.sum().item())
@@ -111,34 +116,45 @@ def organize_draft_results(
             # Gather from topk results
             all_indices = top_indices[request_indices, local_indices]
             all_tokens = top_tokens[request_indices, local_indices]
-            all_scores = top_scores_values[request_indices, local_indices]
 
             # Split into lists
             sizes = draft_counts.tolist()
             top_scores_index = list(torch.split(all_indices, sizes))
             draft_tokens = list(torch.split(all_tokens, sizes))
-            selected_scores = list(torch.split(all_scores, sizes))
+
+            # Only compute selected_scores during profiling (for calibration data)
+            if is_tilespec_profiling:
+                top_scores_values = torch.gather(scores, dim=1, index=top_indices)
+                all_scores = top_scores_values[request_indices, local_indices]
+                selected_scores = list(torch.split(all_scores, sizes))
+            else:
+                selected_scores = None
         else:
             top_scores_index = [torch.empty(0, dtype=torch.long, device=device) for _ in range(bs)]
             draft_tokens = [torch.empty(0, dtype=tokens.dtype, device=device) for _ in range(bs)]
-            selected_scores = [torch.empty(0, dtype=scores.dtype, device=device) for _ in range(bs)]
+            selected_scores = None
+
+        # Build parent_list for TileSpec case
+        if len(parents_list) > 1:
+            parent_list = torch.cat(parents_list[:-1], dim=1)
+        else:
+            parent_list = torch.empty(bs, 0, device=device)
+
+        return parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores
 
     else:
-        # Original EAGLE: uniform selection
+        # Original EAGLE: uniform selection (returns 3 values for CUDA graph compatibility)
         top_scores = torch.topk(scores, num_draft_token - 1, dim=-1)
         top_scores_index = torch.sort(top_scores.indices).values
         draft_tokens = torch.gather(tokens, index=top_scores_index, dim=1)
-        selected_scores = torch.gather(scores, dim=1, index=top_scores_index)
-        per_request_draft_token_num = None
-        logger.debug(f"TileSpec [Disabled]: uniform bs={bs}, draft_per_req={num_draft_token-1}")
 
-    # Build parent_list
-    if len(parents_list) > 1:
-        parent_list = torch.cat(parents_list[:-1], dim=1)
-    else:
-        parent_list = torch.empty(bs, 0, device=device)
+        # Build parent_list
+        if len(parents_list) > 1:
+            parent_list = torch.cat(parents_list[:-1], dim=1)
+        else:
+            parent_list = torch.empty(bs, 0, device=device)
 
-    return parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores
+        return parent_list, top_scores_index, draft_tokens
 
 
 class TreeMaskMode(IntEnum):
@@ -203,7 +219,7 @@ def build_tree_kernel_efficient(
     elif tree_mask_mode == TreeMaskMode.QLEN_ONLY:
         # QLEN_ONLY: num_verify_tokens^2 per request
         if per_request_draft_token_num is not None:
-            mask_size = sum(c**2 for c in per_request_draft_token_num.tolist())
+            mask_size = (per_request_draft_token_num ** 2).sum().item()
         else:
             mask_size = num_verify_tokens * bs * num_verify_tokens
         tree_mask = torch.full(
@@ -229,7 +245,7 @@ def build_tree_kernel_efficient(
         # FULL_MASK: prompt→draft + draft→draft attention
         if per_request_draft_token_num is not None:
             total_verify_tokens = per_request_draft_token_num.sum().item()
-            draft_draft_size = sum(c**2 for c in per_request_draft_token_num.tolist())
+            draft_draft_size = (per_request_draft_token_num ** 2).sum().item()
             mask_size = seq_lens_sum * total_verify_tokens + draft_draft_size
         else:
             mask_size = (
@@ -344,14 +360,15 @@ def build_tree_kernel_efficient(
                     tree_mask_mode,
                 )
 
-            # TileSpec fix: kernel computes local indices (bid=0), convert to global
-            # retrive_index values are used by verify_tree_greedy to fill accept_index
-            global_offset = draft_offsets[req_idx].item()
-            if global_offset > 0:
-                retrive_index[req_idx, :req_count] += global_offset
+            # TileSpec fix: kernel computes local indices (bid=0), convert to PADDED global
+            # retrive_index values are used by verify_tree_greedy to access padded arrays
+            # (candidates, target_predict are padded to [bs, max_verify_tokens])
+            # Use padded offset (req_idx * max_verify_tokens), NOT ragged offset (draft_offsets)
+            padded_offset = req_idx * max_verify_tokens
+            if padded_offset > 0:
+                retrive_index[req_idx, :req_count] += padded_offset
     else:
         # Uniform case: call kernel once with batched inputs (original behavior)
-        logger.debug(f"TileSpec [BuildTree]: Using uniform path, bs={bs}, draft_per_req={num_verify_tokens}")
         if _is_npu:
             torch.ops.npu.build_tree_kernel_efficient(
                 parent_list.to(dtype=torch.int64),

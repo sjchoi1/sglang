@@ -311,9 +311,9 @@ class EAGLEDraftCudaGraphRunner:
         return graph, out
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
-        # Keep the variables name for readability
-        parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)
-        return parent_list, top_scores_index, draft_tokens
+        # Handle both 3-value (uniform) and 5-value (TileSpec) outputs
+        # Slice each tensor to raw_bs
+        return tuple(t[:raw_bs] if hasattr(t, '__getitem__') else t for t in out)
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
