@@ -307,13 +307,18 @@ def build_tree_kernel_efficient(
         else:
             raise NotImplementedError(f"Invalid tree mask mode: {tree_mask_mode}")
 
+        # Convert to CPU lists once to avoid repeated GPU syncs in the loop
+        counts_cpu = per_request_draft_token_num.tolist()
+        draft_offsets_cpu = draft_offsets.tolist()
+        mask_offsets_cpu = mask_offsets.tolist()
+
         # Loop over each request and call kernel
         for req_idx in range(bs):
-            req_count = per_request_draft_token_num[req_idx].item()
+            req_count = counts_cpu[req_idx]
 
             # Slice flattened draft data
-            draft_start = draft_offsets[req_idx].item()
-            draft_end = draft_offsets[req_idx + 1].item()
+            draft_start = draft_offsets_cpu[req_idx]
+            draft_end = draft_offsets_cpu[req_idx + 1]
 
             # top_scores_index doesn't include verified token, so offset by 1 per request
             # In flattened layout: [v0, d0_0, ..., v1, d1_0, ...]
@@ -324,8 +329,8 @@ def build_tree_kernel_efficient(
 
             # Slice output buffers
             req_positions = positions[draft_start:draft_end]
-            mask_start = mask_offsets[req_idx].item()
-            mask_end = mask_offsets[req_idx + 1].item()
+            mask_start = mask_offsets_cpu[req_idx]
+            mask_end = mask_offsets_cpu[req_idx + 1]
             req_tree_mask = tree_mask[mask_start:mask_end]
 
             # Call kernel with bs=1 and uniform count

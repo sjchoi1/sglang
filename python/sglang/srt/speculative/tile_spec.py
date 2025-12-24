@@ -146,7 +146,7 @@ class PiecewiseLinearLatency:
         Args:
             token_counts: list of token counts profiled
             latencies: corresponding latencies (ms)
-            jump_threshold: relative jump to detect boundary (0.05 = 5%)
+            jump_threshold: relative jump to detect boundary (0.1 = 10%)
         """
         assert len(token_counts) == len(latencies), f"Mismatched lengths: {len(token_counts)} vs {len(latencies)}"
         if len(token_counts) == 0:

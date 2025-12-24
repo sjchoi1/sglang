@@ -356,10 +356,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         bs = self.retrive_index.shape[0]
 
+        # Compute max_count and offsets once for TileSpec ragged case (avoids repeated GPU syncs)
+        if self.per_request_draft_token_num is not None:
+            max_count = self.per_request_draft_token_num.max().item()
+            # Precompute offset difference for padded↔ragged index conversion
+            padded_offsets = torch.arange(bs, device=batch.device, dtype=torch.long) * max_count
+            ragged_offsets = torch.cat([
+                torch.zeros(1, device=batch.device, dtype=torch.long),
+                self.per_request_draft_token_num.cumsum(0)[:-1]
+            ])
+            offset_diff = ragged_offsets - padded_offsets  # [bs]
+        else:
+            max_count = self.draft_token_num
+            offset_diff = None
+
         # Handle both uniform and per-request draft tokens
         if self.per_request_draft_token_num is not None:
             # Ragged case: pad to max count for verification kernel
-            max_count = self.per_request_draft_token_num.max().item()
             candidates = _pad_to_2d(
                 self.draft_token, self.per_request_draft_token_num, max_count, pad_value=-1
             )
@@ -443,7 +456,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             # Handle both uniform and per-request draft tokens
             if self.per_request_draft_token_num is not None:
                 # Ragged case: pad to max count
-                max_count = self.per_request_draft_token_num.max().item()
                 target_predict = _pad_to_2d(
                     target_predict, self.per_request_draft_token_num, max_count, pad_value=-1
                 )
@@ -499,7 +511,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             # Handle both uniform and per-request draft tokens
             if self.per_request_draft_token_num is not None:
                 # Ragged case: pad to max count
-                max_count = self.per_request_draft_token_num.max().item()
                 target_probs = _pad_to_2d(
                     target_probs, self.per_request_draft_token_num, max_count, pad_value=0.0
                 )
@@ -604,8 +615,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
             # Map accept_index to selected_scores indices
             # Note: accept_index has PADDED indices when per_request_draft_token_num is set
-            if self.per_request_draft_token_num is not None:
-                max_count = self.per_request_draft_token_num.max().item()
             score_offset = 0  # offset into selected_scores (no verified)
             for req_idx in range(bs):
                 num_tokens = tokens_per_req[req_idx]
@@ -636,22 +645,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # - predict is PADDED, so use padded indices
         # - evict_mask, out_cache_loc, hidden_states are RAGGED, so convert to ragged
         if self.per_request_draft_token_num is not None:
-            max_count = self.per_request_draft_token_num.max().item()
-            # Compute offset difference: ragged - padded for each request
-            padded_offsets = torch.arange(bs, device=batch.device, dtype=torch.long) * max_count
-            ragged_offsets = torch.cat([
-                torch.zeros(1, device=batch.device, dtype=torch.long),
-                self.per_request_draft_token_num.cumsum(0)[:-1]
-            ])
-            offset_diff = (ragged_offsets - padded_offsets).to(torch.int32)  # [bs]
-
             # Get padded indices for predict access
             accept_index_padded_flat = accept_index[accept_index != -1]
             verified_id = predict[accept_index_padded_flat]
 
             # Convert to ragged indices for evict_mask, out_cache_loc, hidden_states
             valid_mask = accept_index != -1
-            accept_index_ragged = accept_index + offset_diff.unsqueeze(1)
+            accept_index_ragged = accept_index + offset_diff.to(torch.int32).unsqueeze(1)
             accept_index_ragged[~valid_mask] = -1
             accept_index = accept_index_ragged[accept_index_ragged != -1]  # 1D ragged
         else:
@@ -784,13 +784,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 # Convert unfinished_accept_index from padded to ragged for out_cache_loc/hidden_states
                 # Keep padded version for predict access
                 if self.per_request_draft_token_num is not None:
-                    max_count = self.per_request_draft_token_num.max().item()
-                    padded_offsets = torch.arange(bs, device=batch.device, dtype=torch.long) * max_count
-                    ragged_offsets = torch.cat([
-                        torch.zeros(1, device=batch.device, dtype=torch.long),
-                        self.per_request_draft_token_num.cumsum(0)[:-1]
-                    ])
-                    offset_diff = (ragged_offsets - padded_offsets).to(torch.long)
                     req_idx = unfinished_accept_index // max_count
                     unfinished_accept_index_ragged = unfinished_accept_index + offset_diff[req_idx]
                 else:

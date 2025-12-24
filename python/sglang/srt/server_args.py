@@ -1957,6 +1957,13 @@ class ServerArgs:
                     "TileSpec uses dynamic per-request token selection which is incompatible with CUDA graph capture."
                 )
 
+            # TileSpec requires page_size=1 (default)
+            if self.tile_spec and self.page_size > 1:
+                raise ValueError(
+                    f"TileSpec (--tile-spec) is not compatible with page_size > 1 (got {self.page_size}). "
+                    "TileSpec uses ragged token layouts which are incompatible with paged KV cache eviction kernels."
+                )
+
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(
