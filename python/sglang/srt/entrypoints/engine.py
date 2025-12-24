@@ -265,7 +265,7 @@ class Engine(EngineBase):
         # TileSpec warmup (if enabled)
         tile_spec_warmup(
             self.server_args,
-            lambda prompts: self.generate(prompts, sampling_params={"temperature": 0, "max_new_tokens": 64}),
+            lambda prompts: self.generate(prompts, sampling_params={"temperature": 0, "max_new_tokens": 32}),
             self.tile_spec_ready,
             self.finish_tile_spec_profiling,
         )

@@ -1622,7 +1622,7 @@ def _execute_server_warmup(
         server_args,
         lambda prompts: requests.post(
             url + "/generate",
-            json={"text": prompts, "sampling_params": {"temperature": 0, "max_new_tokens": 64}},
+            json={"text": prompts, "sampling_params": {"temperature": 0, "max_new_tokens": 32}},
             headers=headers,
             timeout=120,
         ),

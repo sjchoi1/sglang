@@ -486,10 +486,25 @@ class TileSpecProfiler:
             fit_y = [self.latency_model.predict(n) for n in fit_x]
             ax.plot(fit_x, fit_y, 'r-', linewidth=2, label='Fitted model')
 
-            # Mark tile boundaries
-            for boundary in self.latency_model.boundaries:
+            # Mark tile boundaries (skip first boundary which is just the starting point)
+            boundaries = self.latency_model.boundaries
+            y_min, y_max = ax.get_ylim()
+            label_y = y_min - (y_max - y_min) * 0.08  # Position labels below plot
+
+            for i, boundary in enumerate(boundaries[1:-1], start=1):  # Skip first and last
                 if boundary <= max_tokens:
-                    ax.axvline(boundary, color='red', linestyle=':', alpha=0.5, linewidth=1)
+                    # Draw emphasized vertical line at tile boundary
+                    ax.axvline(boundary, color='red', linestyle='--', alpha=0.8, linewidth=2)
+                    # Add token boundary label (e.g., "64→65")
+                    prev_token = boundary - 1
+                    label_text = f"{prev_token}→{boundary}"
+                    ax.text(boundary, label_y, label_text, ha='center', va='top',
+                           fontsize=9, color='red', fontweight='bold',
+                           bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
+                                    edgecolor='red', alpha=0.8))
+
+            # Adjust y-axis to make room for labels
+            ax.set_ylim(y_min - (y_max - y_min) * 0.15, y_max)
 
         ax.set_xlabel('Total Tokens', fontsize=12)
         ax.set_ylabel('Latency (ms)', fontsize=12)
