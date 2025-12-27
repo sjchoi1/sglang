@@ -1964,20 +1964,6 @@ class ServerArgs:
                     "TileSpec uses ragged token layouts which are incompatible with paged KV cache eviction kernels."
                 )
 
-            # TileSpec dynamically selects draft token count; speculative_num_draft_tokens is used as max for memory allocation
-            if self.tile_spec:
-                if self.speculative_num_draft_tokens is None:
-                    self.speculative_num_draft_tokens = 64
-                    logger.info(
-                        "TileSpec: speculative_num_draft_tokens set to 64 (max for memory allocation). "
-                        "TileSpec will dynamically select optimal count up to this limit."
-                    )
-                else:
-                    logger.info(
-                        f"TileSpec: speculative_num_draft_tokens={self.speculative_num_draft_tokens} used as max for memory allocation. "
-                        "TileSpec will dynamically select optimal count up to this limit."
-                    )
-
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(

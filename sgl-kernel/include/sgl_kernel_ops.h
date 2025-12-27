@@ -544,23 +544,6 @@ void build_tree_kernel_efficient(
     int64_t draft_token_num,
     int64_t tree_mask_mode);
 
-void build_tree_kernel_efficient_ragged(
-    at::Tensor parent_list,
-    at::Tensor selected_index,
-    at::Tensor verified_seq_len,
-    at::Tensor tree_mask,
-    at::Tensor positions,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
-    at::Tensor token_indptr,
-    at::Tensor score_indptr,
-    at::Tensor mask_indptr,
-    int64_t topk,
-    int64_t depth,
-    int64_t max_draft_token_num,
-    int64_t tree_mask_mode);
-
 void segment_packbits(
     at::Tensor x,
     at::Tensor input_indptr,

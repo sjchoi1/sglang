@@ -13,8 +13,10 @@ _is_npu = is_npu()
 if _is_cuda or _is_hip:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
-        build_tree_kernel_efficient_ragged as sgl_build_tree_kernel_ragged,
     )
+    # TileSpec ragged kernel - from tile_spec_kernels package
+    # Install with: cd tile_spec/kernels && pip install . --no-build-isolation
+    from tile_spec_kernels import build_tree_kernel_efficient_ragged as sgl_build_tree_kernel_ragged
 
 
 import time
