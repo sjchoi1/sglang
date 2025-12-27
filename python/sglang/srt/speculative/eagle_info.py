@@ -29,7 +29,10 @@ from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
 )
-from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
+from sglang.srt.speculative.eagle_utils import (
+    verify_tree_greedy_func,
+    sgl_verify_tree_greedy_ragged,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -185,6 +188,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     _cached_max_count: Optional[int] = None
     _cached_total_tokens: Optional[int] = None
     _cached_squared_sum: Optional[int] = None
+
+    # Pre-computed indptr array for ragged kernels (from organize_draft_results)
+    token_indptr: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
@@ -425,50 +431,38 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         bs = self.retrive_index.shape[0]
 
-        # Compute max_count and offsets once for TileSpec ragged case (avoids repeated GPU syncs)
+        # Compute max_count for TileSpec ragged case
+        # Padding indices are computed lazily only when needed (non-greedy path)
         if _TILESPEC_DEBUG and self.per_request_draft_token_num is not None:
             torch.cuda.synchronize()
             _t_verify_start = time.perf_counter()
 
         if self.per_request_draft_token_num is not None:
             max_count = self._cached_max_count  # Use cached value from prepare_for_verify
-            total_tokens = self.draft_token.shape[0]
-            # Precompute padding indices once for reuse across multiple pad calls
-            pad_row_indices, pad_col_indices = _compute_pad_indices(
-                self.per_request_draft_token_num, total_tokens, batch.device
-            )
-            # Precompute offset difference for padded↔ragged index conversion
-            padded_offsets = torch.arange(bs, device=batch.device, dtype=torch.long) * max_count
-            ragged_offsets = torch.cat([
-                torch.zeros(1, device=batch.device, dtype=torch.long),
-                self.per_request_draft_token_num.cumsum(0)[:-1]
-            ])
-            offset_diff = ragged_offsets - padded_offsets  # [bs]
         else:
             max_count = self.draft_token_num
-            offset_diff = None
-            pad_row_indices, pad_col_indices = None, None
             if _TILESPEC_DEBUG:
                 torch.cuda.synchronize()
                 _t_verify_start = time.perf_counter()
 
         # Handle both uniform and per-request draft tokens
         if self.per_request_draft_token_num is not None:
-            # Ragged case: pad to max count for verification kernel (use cached indices)
-            candidates = _pad_to_2d_with_indices(
-                self.draft_token, pad_row_indices, pad_col_indices, bs, max_count, pad_value=-1
-            )
+            # Ragged case: keep as 1D (no padding needed for ragged verify kernel!)
+            candidates = self.draft_token  # [total_tokens] - already 1D ragged
+            # Use pre-computed token_indptr from organize_draft_results
+            token_indptr = self.token_indptr
         else:
             # Uniform case: simple reshape
             candidates = self.draft_token.reshape(bs, self.draft_token_num)
+            token_indptr = None
 
         sampling_info = batch.sampling_info
 
-        # predict must match the layout of target_predict (padded or uniform)
+        # predict must match the layout of target_predict (ragged or uniform)
         # The CUDA kernel writes predicts[idx] using same indices as target_predict[idx]
         if self.per_request_draft_token_num is not None:
-            # Padded case: [bs * max_count] to match padded target_predict layout
-            predict_size = bs * max_count
+            # Ragged case: [total_tokens] to match ragged target_predict layout
+            predict_size = self.draft_token.shape[0]
         else:
             # Uniform case: [bs * draft_token_num]
             predict_size = bs * self.draft_token_num
@@ -506,6 +500,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             sampling_info.penalizer_orchestrator.is_required
             or sampling_info.logit_bias is not None
         ):
+            # TileSpec greedy path doesn't support penalties yet
+            assert self.per_request_draft_token_num is None, (
+                "TileSpec doesn't support penalties/logit_bias yet. "
+                "Disable repetition_penalty and logit_bias when using --tile-spec."
+            )
             # This is a relaxed version of penalties for speculative decoding.
             linear_penalty = torch.zeros(
                 (bs, logits_output.next_token_logits.shape[1]),
@@ -513,13 +512,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 device=batch.device,
             )
             sampling_info.apply_logits_bias(linear_penalty)
-            if self.per_request_draft_token_num is not None:
-                # Use indexing instead of repeat_interleave for ragged case
-                logits_output.next_token_logits.add_(linear_penalty[pad_row_indices])
-            else:
-                logits_output.next_token_logits.add_(
-                    torch.repeat_interleave(linear_penalty, tokens_per_request, dim=0)
-                )
+            logits_output.next_token_logits.add_(
+                torch.repeat_interleave(linear_penalty, tokens_per_request, dim=0)
+            )
 
         # Apply grammar mask
         if vocab_mask is not None:
@@ -541,29 +536,44 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
             # Handle both uniform and per-request draft tokens
             if self.per_request_draft_token_num is not None:
-                # Ragged case: pad to max count (use cached indices)
-                target_predict = _pad_to_2d_with_indices(
-                    target_predict, pad_row_indices, pad_col_indices, bs, max_count, pad_value=-1
+                # Ragged case: keep as 1D (no padding needed for ragged verify kernel!)
+                # target_predict is already [total_tokens] from argmax
+                sgl_verify_tree_greedy_ragged(
+                    predicts=predict,  # [total_tokens] - mutable
+                    accept_index=accept_index,  # [bs, spec_steps+1] - mutable
+                    accept_token_num=accept_length,  # [bs] - mutable
+                    candidates=candidates,  # [total_tokens] - 1D ragged
+                    retrive_index=self.retrive_index,  # [bs, max_count] - padded, VALUES are ragged
+                    retrive_next_token=self.retrive_next_token,  # [bs, max_count] - padded
+                    retrive_next_sibling=self.retrive_next_sibling,  # [bs, max_count] - padded
+                    target_predict=target_predict,  # [total_tokens] - 1D ragged
+                    token_indptr=token_indptr,  # [bs+1]
+                    num_speculative_tokens=self.spec_steps + 1,
                 )
+                # accept_index now has RAGGED indices (matching ragged predict layout)
             else:
-                # Uniform case: simple reshape
+                # Uniform case: simple reshape and use original kernel
                 target_predict = target_predict.reshape(bs, self.draft_token_num)
-
-            predict, accept_index, accept_length = verify_tree_greedy_func(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=accept_length,  # mutable
-                candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
-                target_predict=target_predict,
-                topk=self.topk,
-            )
-            # NOTE: accept_index now has PADDED indices (matching predict layout)
-            # We'll convert to ragged indices later, only for evict_mask
+                predict, accept_index, accept_length = verify_tree_greedy_func(
+                    predicts=predict,  # mutable
+                    accept_index=accept_index,  # mutable
+                    accept_token_num=accept_length,  # mutable
+                    candidates=candidates,
+                    retrive_index=self.retrive_index,
+                    retrive_next_token=self.retrive_next_token,
+                    retrive_next_sibling=self.retrive_next_sibling,
+                    target_predict=target_predict,
+                    topk=self.topk,
+                )
 
         else:
+            # Non-greedy sampling path
+            # TileSpec ragged path not yet optimized for non-greedy sampling
+            assert self.per_request_draft_token_num is None, (
+                "TileSpec (per_request_draft_token_num) only supports greedy sampling. "
+                "Set temperature=0 or use --sampling-defaults greedy."
+            )
+
             # apply temperature and get target probs
             if self.per_request_draft_token_num is not None:
                 # Per-request: use pad_row_indices for indexing (faster than repeat_interleave)
@@ -730,32 +740,17 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
 
-        # For TileSpec ragged case: accept_index has PADDED indices
-        # - predict is PADDED, so use padded indices
-        # - evict_mask, out_cache_loc, hidden_states are RAGGED, so convert to ragged
-        if self.per_request_draft_token_num is not None:
-            # Get padded indices for predict access
-            accept_index_padded_flat = accept_index[accept_index != -1]
-            verified_id = predict[accept_index_padded_flat]
+        # With ragged verify kernel: accept_index already has RAGGED indices
+        # predict is also RAGGED [total_tokens], so no conversion needed!
+        accept_index = accept_index[accept_index != -1]
+        verified_id = predict[accept_index]
 
-            # Convert to ragged indices for evict_mask, out_cache_loc, hidden_states
-            valid_mask = accept_index != -1
-            accept_index_ragged = accept_index + offset_diff.to(torch.int32).unsqueeze(1)
-            accept_index_ragged[~valid_mask] = -1
-            accept_index = accept_index_ragged[accept_index_ragged != -1]  # 1D ragged
-
-            if _TILESPEC_DEBUG:
-                torch.cuda.synchronize()
-                _t_verify_end = time.perf_counter()
+        if _TILESPEC_DEBUG:
+            torch.cuda.synchronize()
+            _t_verify_end = time.perf_counter()
+            if self.per_request_draft_token_num is not None:
                 print(f"[TileSpec] verify() ragged overhead: {(_t_verify_end-_t_verify_start)*1000:.3f}ms (bs={bs})")
-        else:
-            # Uniform case: padded == ragged, no conversion needed
-            accept_index = accept_index[accept_index != -1]
-            verified_id = predict[accept_index]
-
-            if _TILESPEC_DEBUG:
-                torch.cuda.synchronize()
-                _t_verify_end = time.perf_counter()
+            else:
                 print(f"[EAGLE] verify() uniform: {(_t_verify_end-_t_verify_start)*1000:.3f}ms (bs={bs})")
 
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
@@ -880,13 +875,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             if len(unfinished_accept_index) > 0:
                 unfinished_accept_index = torch.cat(unfinished_accept_index)
 
-                # Convert unfinished_accept_index from padded to ragged for out_cache_loc/hidden_states
-                # Keep padded version for predict access
-                if self.per_request_draft_token_num is not None:
-                    req_idx = unfinished_accept_index // max_count
-                    unfinished_accept_index_ragged = unfinished_accept_index + offset_diff[req_idx]
-                else:
-                    unfinished_accept_index_ragged = unfinished_accept_index
+                # With ragged verify kernel: accept_index already has RAGGED indices
+                # predict is also RAGGED, so no conversion needed
+                unfinished_accept_index_ragged = unfinished_accept_index
 
                 unfinished_index_device = torch.tensor(
                     unfinished_index, dtype=torch.int64, device=predict.device
@@ -919,9 +910,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
                 draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
-                        unfinished_accept_index_ragged  # ragged for hidden_states
+                        unfinished_accept_index_ragged  # ragged indices
                     ],
-                    verified_id=predict[unfinished_accept_index],  # padded for predict
+                    verified_id=predict[unfinished_accept_index],  # ragged indices, predict is ragged
                     accept_length_cpu=draft_input_accept_length_cpu,
                     accept_length=accept_length[unfinished_index_device],
                     seq_lens_for_draft_extend=batch.seq_lens[unfinished_index_device],

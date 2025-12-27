@@ -14,9 +14,12 @@ if _is_cuda or _is_hip:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
-    # TileSpec ragged kernel - from tile_spec_kernels package
+    # TileSpec ragged kernels - from tile_spec_kernels package
     # Install with: cd tile_spec/kernels && pip install . --no-build-isolation
-    from tile_spec_kernels import build_tree_kernel_efficient_ragged as sgl_build_tree_kernel_ragged
+    from tile_spec_kernels import (
+        build_tree_kernel_efficient_ragged as sgl_build_tree_kernel_ragged,
+        verify_tree_greedy_ragged as sgl_verify_tree_greedy_ragged,
+    )
 
 
 import time
@@ -48,13 +51,15 @@ def organize_draft_results(
         top_scores_index: Selected token indices [bs, num_draft_token-1]
         draft_tokens: Selected tokens [bs, num_draft_token-1]
 
-    Returns (ragged path - 6 values):
+    Returns (ragged path - 8 values):
         parent_list: Parent indices [bs, n_parents]
         top_scores_index: Selected token indices [total_drafts] (1D flattened)
         draft_tokens: Selected tokens [total_drafts] (1D flattened)
         per_request_draft_token_num: Per-request counts including verified token [bs]
         sorted_request_ids: Request ID for each draft token [total_drafts]
         selected_scores: Scores for calibration [total_drafts] or None
+        token_indptr: [0, cumsum(per_request_draft_token_num)] - pre-computed for kernels
+        score_indptr: [0, cumsum(per_request_draft_token_num - 1)] - pre-computed for kernels
 
     Note:
         Ragged path returns 1D flattened tensors + sorted_request_ids for near-zero
@@ -98,22 +103,33 @@ def organize_draft_results(
             sorted_col_indices = col_indices[sort_order]
 
             # Return 1D flattened tensors (no padding!)
-            # top_scores_index: column indices for each selected draft token
             top_scores_index = sorted_col_indices  # [total_drafts]
-            # draft_tokens: actual token values
             draft_tokens = tokens[sorted_request_ids, sorted_col_indices]  # [total_drafts]
 
             # Only compute selected_scores during profiling (for calibration data)
             if is_tilespec_profiling:
-                selected_scores = scores[sorted_request_ids, sorted_col_indices]  # [total_drafts]
+                selected_scores = scores[sorted_request_ids, sorted_col_indices]
             else:
                 selected_scores = None
         else:
-            per_request_draft_token_num = torch.ones(bs, dtype=torch.long, device=device)  # Just verified token
+            # Edge case: no draft tokens (num_draft_token == 1)
+            per_request_draft_token_num = torch.ones(bs, dtype=torch.long, device=device)
             top_scores_index = torch.empty(0, dtype=torch.long, device=device)
             draft_tokens = torch.empty(0, dtype=tokens.dtype, device=device)
             sorted_request_ids = torch.empty(0, dtype=torch.long, device=device)
             selected_scores = None
+
+        # Pre-compute indptr arrays (avoids recomputation in build_tree_kernel_efficient)
+        token_cumsum = per_request_draft_token_num.cumsum(0)
+        token_indptr = torch.cat([
+            torch.zeros(1, device=device, dtype=torch.long),
+            token_cumsum
+        ])
+        score_cumsum = (per_request_draft_token_num - 1).cumsum(0)
+        score_indptr = torch.cat([
+            torch.zeros(1, device=device, dtype=torch.long),
+            score_cumsum
+        ])
 
         # Build parent_list for TileSpec case
         if len(parents_list) > 1:
@@ -126,7 +142,7 @@ def organize_draft_results(
             _t1 = time.perf_counter()
             print(f"[TileSpec] organize_draft_results ragged: {(_t1-_t0)*1000:.3f}ms (bs={bs})")
 
-        return parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, sorted_request_ids, selected_scores
+        return parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, sorted_request_ids, selected_scores, token_indptr, score_indptr
 
     else:
         # Original EAGLE: uniform selection (returns 3 values for CUDA graph compatibility)
@@ -173,6 +189,8 @@ def build_tree_kernel_efficient(
     position_buf: Optional[torch.Tensor] = None,
     per_request_draft_token_num: Optional[torch.Tensor] = None,
     sorted_request_ids: Optional[torch.Tensor] = None,
+    token_indptr: Optional[torch.Tensor] = None,
+    score_indptr: Optional[torch.Tensor] = None,
 ):
     # Handle uniform (2D Tensor) vs ragged (1D Tensor with sorted_request_ids)
     if per_request_draft_token_num is not None and sorted_request_ids is not None:
@@ -183,15 +201,13 @@ def build_tree_kernel_efficient(
         bs = verified_id.shape[0]
         total_tokens = per_request_draft_token_num.sum().item()
 
-        # Compute offsets for output positions
-        token_offsets = torch.cat([
-            torch.zeros(1, device=device, dtype=torch.long),
-            per_request_draft_token_num.cumsum(0)[:-1]
-        ])  # [bs]
-        draft_offsets = torch.cat([
-            torch.zeros(1, device=device, dtype=torch.long),
-            (per_request_draft_token_num - 1).cumsum(0)[:-1]
-        ])  # [bs] - offsets into draft_tokens (without verified)
+        # Use pre-computed indptr arrays (from organize_draft_results)
+        # token_indptr = [0, cumsum(per_request_draft_token_num)] has bs+1 elements
+        # score_indptr = [0, cumsum(per_request_draft_token_num - 1)] has bs+1 elements
+        # token_offsets = token_indptr[:-1] (first bs elements)
+        # draft_offsets = score_indptr[:-1] (first bs elements)
+        token_offsets = token_indptr[:-1]  # [bs]
+        draft_offsets = score_indptr[:-1]  # [bs] - offsets into draft_tokens (without verified)
 
         # Build output tensor (use torch.long as required by verify_tree_greedy kernel)
         draft_tokens_with_verified = torch.empty(total_tokens, dtype=torch.long, device=device)
@@ -302,21 +318,8 @@ def build_tree_kernel_efficient(
             torch.cuda.synchronize()
             _t0 = time.perf_counter()
 
-        # Calculate indptr arrays for ragged kernel
-        # token_indptr: cumsum of per_request_draft_token_num (includes verified)
-        token_indptr = torch.cat([
-            torch.zeros(1, device=device, dtype=torch.long),
-            per_request_draft_token_num.cumsum(0)
-        ])
-
-        # score_indptr: cumsum of (per_request_draft_token_num - 1) (excludes verified)
-        draft_counts = per_request_draft_token_num - 1
-        score_indptr = torch.cat([
-            torch.zeros(1, device=device, dtype=torch.long),
-            draft_counts.cumsum(0)
-        ])
-
-        # mask_indptr: depends on tree_mask_mode
+        # token_indptr and score_indptr are pre-computed in organize_draft_results
+        # Only compute mask_indptr here (depends on tree_mask_mode and seq_lens)
         if tree_mask_mode == TreeMaskMode.QLEN_ONLY:
             # mask_size per request = count^2
             mask_indptr = torch.cat([
@@ -324,8 +327,8 @@ def build_tree_kernel_efficient(
                 (per_request_draft_token_num ** 2).cumsum(0)
             ])
         elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
-            # mask_size per request = count
-            mask_indptr = token_indptr.clone()
+            # mask_size per request = count (same as token_indptr)
+            mask_indptr = token_indptr
         elif tree_mask_mode == TreeMaskMode.FULL_MASK:
             # mask_size per request = seq_len * count + count^2
             mask_sizes = seq_lens * per_request_draft_token_num + per_request_draft_token_num ** 2
