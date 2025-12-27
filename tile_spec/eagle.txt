@@ -1,0 +1,80 @@
+Loaded cached results from /workspace/sglang/tile_spec/results_llama-31-8b-instruct_sglang-eagle3-llama31-instruct-8b.json
+Loading /workspace/sglang/tile_spec/question.jsonl
+  mt_conv: 80 samples
+
+============================================================
+Category: mt_conv (80 samples)
+============================================================
+
+  Batch size: 8
+    Eagle3+TileSpec... Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/sglang/python/sglang/launch_server.py", line 7, in <module>
+command=python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --dtype float16 --disable-cuda-graph --max-running-requests 8 --speculative-algorithm EAGLE3 --speculative-draft-model-path lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3 --tile-spec --device cuda --host 127.0.0.1 --port 30000
+Traceback (most recent call last):
+  File "/workspace/sglang/tile_spec/run_bench.py", line 268, in <module>
+    from sglang.srt.server_args import prepare_server_args
+  File "/workspace/sglang/python/sglang/srt/server_args.py", line 33, in <module>
+    from sglang.srt.function_call.function_call_parser import FunctionCallParser
+    main()
+  File "/workspace/sglang/python/sglang/srt/function_call/function_call_parser.py", line 4, in <module>
+  File "/workspace/sglang/tile_spec/run_bench.py", line 228, in main
+    from sglang.srt.entrypoints.openai.protocol import (
+  File "/workspace/sglang/python/sglang/srt/entrypoints/openai/protocol.py", line 22, in <module>
+    from openai.types.responses import (
+    r = run_config(configs[cfg_name], samples, args.model, args.draft, bs, args.port)
+  File "/usr/local/lib/python3.12/dist-packages/openai/__init__.py", line 9, in <module>
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/sglang/tile_spec/run_bench.py", line 125, in run_config
+    process = popen_launch_server(model, base_url, TIMEOUT, other_args=args)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    from . import types
+  File "/workspace/sglang/python/sglang/test/test_utils.py", line 683, in popen_launch_server
+  File "/usr/local/lib/python3.12/dist-packages/openai/types/__init__.py", line 56, in <module>
+    time.sleep(10)
+KeyboardInterrupt
+    from .eval_create_params import EvalCreateParams as EvalCreateParams
+  File "/usr/local/lib/python3.12/dist-packages/openai/types/eval_create_params.py", line 10, in <module>
+    from .graders.python_grader_param import PythonGraderParam
+  File "/usr/local/lib/python3.12/dist-packages/openai/types/graders/__init__.py", line 5, in <module>
+    from .multi_grader import MultiGrader as MultiGrader
+  File "/usr/local/lib/python3.12/dist-packages/openai/types/graders/multi_grader.py", line 8, in <module>
+    from .label_model_grader import LabelModelGrader
+  File "/usr/local/lib/python3.12/dist-packages/openai/types/graders/label_model_grader.py", line 7, in <module>
+    from ..responses.response_input_text import ResponseInputText
+  File "/usr/local/lib/python3.12/dist-packages/openai/types/responses/__init__.py", line 5, in <module>
+    from .tool import Tool as Tool
+  File "/usr/local/lib/python3.12/dist-packages/openai/types/responses/tool.py", line 188, in <module>
+    class ImageGeneration(BaseModel):
+  File "/usr/local/lib/python3.12/dist-packages/openai/types/responses/tool.py", line 212, in ImageGeneration
+    model: Optional[Literal["gpt-image-1", "gpt-image-1-mini"]] = None
+           ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/typing.py", line 395, in inner
+    return _caches[func](*args, **kwds)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/typing.py", line 510, in __getitem__
+    return self._getitem(self, parameters)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/typing.py", line 744, in Optional
+    return Union[arg, type(None)]
+           ~~~~~^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/typing.py", line 395, in inner
+    return _caches[func](*args, **kwds)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/typing.py", line 510, in __getitem__
+    return self._getitem(self, parameters)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/typing.py", line 723, in Union
+    parameters = tuple(_type_check(p, msg) for p in parameters)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/typing.py", line 723, in <genexpr>
+    parameters = tuple(_type_check(p, msg) for p in parameters)
+                       ^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/typing.py", line 193, in _type_check
+    arg = _type_convert(arg, module=module, allow_special_forms=allow_special_forms)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/typing.py", line 166, in _type_convert
+    def _type_convert(arg, module=None, *, allow_special_forms=False):
+    
+KeyboardInterrupt

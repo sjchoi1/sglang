@@ -2413,6 +2413,7 @@ class Scheduler(
                 "pp_max_micro_batch_size",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
+                "max_running_requests",
             ]
         )
 
@@ -2440,6 +2441,9 @@ class Scheduler(
             self.spec_total_num_accepted_tokens = self.spec_total_num_forward_ct = 0
             for k, v in server_args_dict.items():
                 setattr(get_global_server_args(), k, v)
+                # Also update scheduler's internal max_running_requests
+                if k == "max_running_requests":
+                    self.max_running_requests = v
             logger.info(f"Global server args updated! {get_global_server_args()=}")
         return SetInternalStateReqOutput(
             updated=True,

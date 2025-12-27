@@ -1,10 +1,14 @@
 import logging
+import os
+import time
 from copy import copy
 from dataclasses import dataclass
 from typing import ClassVar, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+_TILESPEC_DEBUG = os.environ.get("TILESPEC_DEBUG", "0") == "1"
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
@@ -51,6 +55,73 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
+def _compute_pad_indices(per_request_counts, total_tokens, device):
+    """
+    Compute row and column indices for padding ragged tensors.
+    These indices can be reused across multiple _pad_to_2d_with_indices calls.
+
+    Args:
+        per_request_counts: Tensor [bs] with actual counts per request
+        total_tokens: Total number of tokens across all requests
+        device: Device to create tensors on
+
+    Returns:
+        Tuple of (row_indices, col_indices)
+    """
+    # Compute cumulative offsets: [count0, count0+count1, ...]
+    cumsum = per_request_counts.cumsum(0)
+
+    # Row indices using bucketize (faster than repeat_interleave)
+    # bucketize with right=True: for index i, find smallest j where cumsum[j] > i
+    token_indices = torch.arange(total_tokens, device=device)
+    row_indices = torch.bucketize(token_indices, cumsum, right=True)
+
+    # Column indices using indexing (faster than repeat_interleave)
+    offsets = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
+    col_indices = token_indices - offsets[row_indices]
+
+    return row_indices, col_indices
+
+
+def _pad_to_2d_with_indices(flat_tensor, row_indices, col_indices, bs, max_count, pad_value=-1):
+    """
+    Pad ragged flattened tensor using pre-computed indices.
+    Faster than _pad_to_2d when padding multiple tensors with same layout.
+
+    Args:
+        flat_tensor: Flattened ragged tensor [total_tokens] or [total_tokens, ...]
+        row_indices: Pre-computed row indices from _compute_pad_indices
+        col_indices: Pre-computed column indices from _compute_pad_indices
+        bs: Batch size
+        max_count: Maximum count to pad to
+        pad_value: Value to use for padding
+
+    Returns:
+        Padded tensor [bs, max_count] or [bs, max_count, ...]
+    """
+    device = flat_tensor.device
+    dtype = flat_tensor.dtype
+
+    # Determine output shape based on input dimensions
+    if flat_tensor.ndim == 1:
+        output_shape = (bs, max_count)
+    elif flat_tensor.ndim == 2:
+        output_shape = (bs, max_count, flat_tensor.shape[1])
+    else:
+        raise ValueError(f"Unsupported tensor dimension: {flat_tensor.ndim}")
+
+    # Create padded tensor filled with pad_value
+    padded = torch.full(output_shape, pad_value, dtype=dtype, device=device)
+
+    # Scatter into padded tensor using pre-computed indices
+    if flat_tensor.ndim == 1:
+        padded[row_indices, col_indices] = flat_tensor
+    else:  # ndim == 2
+        padded[row_indices, col_indices, :] = flat_tensor
+
+    return padded
+
+
 def _pad_to_2d(flat_tensor, per_request_counts, max_count, pad_value=-1):
     """
     Pad ragged flattened tensor to uniform 2D [bs, max_count, ...].
@@ -75,41 +146,9 @@ def _pad_to_2d(flat_tensor, per_request_counts, max_count, pad_value=-1):
          [V2, t21, -1, -1, -1]]
     """
     bs = per_request_counts.shape[0]
-    device = flat_tensor.device
-    dtype = flat_tensor.dtype
     total_tokens = flat_tensor.shape[0]
-
-    # Determine output shape based on input dimensions
-    if flat_tensor.ndim == 1:
-        # Token IDs: [total_tokens] → [bs, max_count]
-        output_shape = (bs, max_count)
-    elif flat_tensor.ndim == 2:
-        # Probabilities: [total_tokens, vocab_size] → [bs, max_count, vocab_size]
-        output_shape = (bs, max_count, flat_tensor.shape[1])
-    else:
-        raise ValueError(f"Unsupported tensor dimension: {flat_tensor.ndim}")
-
-    # Create padded tensor filled with pad_value
-    padded = torch.full(output_shape, pad_value, dtype=dtype, device=device)
-
-    # Vectorized copy: compute index tensors and scatter
-    # Compute cumulative offsets: [0, count0, count0+count1, ...]
-    cumsum = per_request_counts.cumsum(0)
-    offsets = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
-
-    # Row indices: [0,0,0, 1,1,1,1,1, 2,2, ...] - which request each token belongs to
-    row_indices = torch.repeat_interleave(torch.arange(bs, device=device), per_request_counts)
-
-    # Column indices: [0,1,2, 0,1,2,3,4, 0,1, ...] - position within each request
-    col_indices = torch.arange(total_tokens, device=device) - torch.repeat_interleave(offsets, per_request_counts)
-
-    # Scatter into padded tensor
-    if flat_tensor.ndim == 1:
-        padded[row_indices, col_indices] = flat_tensor
-    else:  # ndim == 2
-        padded[row_indices, col_indices, :] = flat_tensor
-
-    return padded
+    row_indices, col_indices = _compute_pad_indices(per_request_counts, total_tokens, flat_tensor.device)
+    return _pad_to_2d_with_indices(flat_tensor, row_indices, col_indices, bs, max_count, pad_value)
 
 
 @dataclass
@@ -140,6 +179,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     # Shape info for padding
     num_tokens_per_batch: int = -1
+
+    # Cached values for TileSpec ragged case (computed once in prepare_for_verify)
+    # Avoids redundant GPU syncs across methods
+    _cached_max_count: Optional[int] = None
+    _cached_total_tokens: Optional[int] = None
+    _cached_squared_sum: Optional[int] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
@@ -176,13 +221,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if batch.forward_mode.is_idle():
             return
 
+        if _TILESPEC_DEBUG:
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+
         batch.input_ids = self.draft_token
 
         # For TileSpec: use per-request draft counts
         # For uniform: use scalar draft_token_num (broadcasts to all requests)
         if self.per_request_draft_token_num is not None:
             draft_token_counts = self.per_request_draft_token_num
-            draft_token_counts_cpu = self.per_request_draft_token_num.cpu()
+            # Batch all GPU->CPU transfers in one sync by using .tolist()
+            counts_list = draft_token_counts.tolist()
+            draft_token_counts_cpu = torch.tensor(counts_list, dtype=torch.int64)
+            # Cache computed values from CPU list (no additional GPU sync!)
+            self._cached_max_count = max(counts_list)
+            self._cached_total_tokens = sum(counts_list)
+            self._cached_squared_sum = sum(c * c for c in counts_list)
         else:
             draft_token_counts = self.draft_token_num
             draft_token_counts_cpu = self.draft_token_num
@@ -234,6 +289,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 device=batch.device,
             )
 
+        if _TILESPEC_DEBUG:
+            torch.cuda.synchronize()
+            _t1 = time.perf_counter()
+            path = "ragged" if self.per_request_draft_token_num is not None else "uniform"
+            print(f"[{'TileSpec' if self.per_request_draft_token_num is not None else 'EAGLE'}] prepare_for_verify {path}: {(_t1-_t0)*1000:.3f}ms")
+
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
@@ -241,6 +302,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
     ):
+        if _TILESPEC_DEBUG:
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+
         device = req_pool_indices.device
         batch_size = len(req_pool_indices)
 
@@ -248,7 +313,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if self.per_request_draft_token_num is not None:
             # Ragged case: use actual per-request counts
             draft_counts = self.per_request_draft_token_num
-            total_draft_tokens = draft_counts.sum().item()
+            total_draft_tokens = self._cached_total_tokens  # Use cached value (no GPU sync!)
             # qo_indptr: cumulative offsets for each request
             qo_indptr = torch.cat([
                 torch.zeros(1, dtype=torch.int32, device=device),
@@ -289,10 +354,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
         # Calculate custom mask size (handles both uniform and per-request draft counts)
         if self.per_request_draft_token_num is not None:
-            # Per-request variable counts: sum actual tokens and sum of squares
-            total_verify_tokens = self.per_request_draft_token_num.sum().item()
-            draft_draft_size = (self.per_request_draft_token_num ** 2).sum().item()
-            mask_numel = paged_kernel_lens_sum * total_verify_tokens + draft_draft_size
+            # Per-request: use cached values (computed in prepare_for_verify)
+            mask_numel = paged_kernel_lens_sum * self._cached_total_tokens + self._cached_squared_sum
         else:
             # Uniform counts: original formula
             mask_numel = (
@@ -313,6 +376,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 ],
                 dim=0,
             )
+
+        if _TILESPEC_DEBUG:
+            torch.cuda.synchronize()
+            _t1 = time.perf_counter()
+            path = "ragged" if self.per_request_draft_token_num is not None else "uniform"
+            print(f"[{'TileSpec' if self.per_request_draft_token_num is not None else 'EAGLE'}] generate_attn_arg_prefill {path}: {(_t1-_t0)*1000:.3f}ms")
 
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
@@ -357,8 +426,17 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         bs = self.retrive_index.shape[0]
 
         # Compute max_count and offsets once for TileSpec ragged case (avoids repeated GPU syncs)
+        if _TILESPEC_DEBUG and self.per_request_draft_token_num is not None:
+            torch.cuda.synchronize()
+            _t_verify_start = time.perf_counter()
+
         if self.per_request_draft_token_num is not None:
-            max_count = self.per_request_draft_token_num.max().item()
+            max_count = self._cached_max_count  # Use cached value from prepare_for_verify
+            total_tokens = self.draft_token.shape[0]
+            # Precompute padding indices once for reuse across multiple pad calls
+            pad_row_indices, pad_col_indices = _compute_pad_indices(
+                self.per_request_draft_token_num, total_tokens, batch.device
+            )
             # Precompute offset difference for padded↔ragged index conversion
             padded_offsets = torch.arange(bs, device=batch.device, dtype=torch.long) * max_count
             ragged_offsets = torch.cat([
@@ -369,12 +447,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         else:
             max_count = self.draft_token_num
             offset_diff = None
+            pad_row_indices, pad_col_indices = None, None
+            if _TILESPEC_DEBUG:
+                torch.cuda.synchronize()
+                _t_verify_start = time.perf_counter()
 
         # Handle both uniform and per-request draft tokens
         if self.per_request_draft_token_num is not None:
-            # Ragged case: pad to max count for verification kernel
-            candidates = _pad_to_2d(
-                self.draft_token, self.per_request_draft_token_num, max_count, pad_value=-1
+            # Ragged case: pad to max count for verification kernel (use cached indices)
+            candidates = _pad_to_2d_with_indices(
+                self.draft_token, pad_row_indices, pad_col_indices, bs, max_count, pad_value=-1
             )
         else:
             # Uniform case: simple reshape
@@ -405,7 +487,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if self.per_request_draft_token_num is not None:
             # Per-request: use actual counts
             tokens_per_request = self.per_request_draft_token_num
-            num_tokens_in_batch = self.per_request_draft_token_num.max().item()
+            num_tokens_in_batch = max_count  # Reuse already computed value
         else:
             # Uniform: use constant draft_token_num
             tokens_per_request = self.draft_token_num
@@ -431,9 +513,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 device=batch.device,
             )
             sampling_info.apply_logits_bias(linear_penalty)
-            logits_output.next_token_logits.add_(
-                torch.repeat_interleave(linear_penalty, tokens_per_request, dim=0)
-            )
+            if self.per_request_draft_token_num is not None:
+                # Use indexing instead of repeat_interleave for ragged case
+                logits_output.next_token_logits.add_(linear_penalty[pad_row_indices])
+            else:
+                logits_output.next_token_logits.add_(
+                    torch.repeat_interleave(linear_penalty, tokens_per_request, dim=0)
+                )
 
         # Apply grammar mask
         if vocab_mask is not None:
@@ -455,9 +541,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
             # Handle both uniform and per-request draft tokens
             if self.per_request_draft_token_num is not None:
-                # Ragged case: pad to max count
-                target_predict = _pad_to_2d(
-                    target_predict, self.per_request_draft_token_num, max_count, pad_value=-1
+                # Ragged case: pad to max count (use cached indices)
+                target_predict = _pad_to_2d_with_indices(
+                    target_predict, pad_row_indices, pad_col_indices, bs, max_count, pad_value=-1
                 )
             else:
                 # Uniform case: simple reshape
@@ -478,41 +564,42 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             # We'll convert to ragged indices later, only for evict_mask
 
         else:
-            # Determine repeat counts for per-request or uniform case
-            if self.per_request_draft_token_num is not None:
-                # Per-request: use actual counts for repeat_interleave
-                repeat_counts = self.per_request_draft_token_num
-            else:
-                # Uniform: use constant draft_token_num
-                repeat_counts = self.draft_token_num
-
             # apply temperature and get target probs
-            expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, repeat_counts, dim=0
-            )  # (total_tokens, 1)
+            if self.per_request_draft_token_num is not None:
+                # Per-request: use pad_row_indices for indexing (faster than repeat_interleave)
+                expanded_temperature = sampling_info.temperatures[pad_row_indices]
+                expanded_top_ks = sampling_info.top_ks[pad_row_indices]
+                expanded_top_ps = sampling_info.top_ps[pad_row_indices]
+            else:
+                # Uniform: repeat_interleave with scalar is efficient
+                expanded_temperature = torch.repeat_interleave(
+                    sampling_info.temperatures, self.draft_token_num, dim=0
+                )
+                expanded_top_ks = torch.repeat_interleave(
+                    sampling_info.top_ks, self.draft_token_num, dim=0
+                )
+                expanded_top_ps = torch.repeat_interleave(
+                    sampling_info.top_ps, self.draft_token_num, dim=0
+                )
 
             target_probs = F.softmax(
                 logits_output.next_token_logits / expanded_temperature, dim=-1
             )  # (total_tokens, vocab_size)
             target_probs = top_k_renorm_prob(
                 target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, repeat_counts, dim=0
-                ),
+                expanded_top_ks,
             )  # (total_tokens, vocab_size)
             if not torch.all(sampling_info.top_ps == 1.0):
                 target_probs = top_p_renorm_prob(
                     target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ps, repeat_counts, dim=0
-                    ),
+                    expanded_top_ps,
                 )
 
             # Handle both uniform and per-request draft tokens
             if self.per_request_draft_token_num is not None:
-                # Ragged case: pad to max count
-                target_probs = _pad_to_2d(
-                    target_probs, self.per_request_draft_token_num, max_count, pad_value=0.0
+                # Ragged case: pad to max count (use cached indices)
+                target_probs = _pad_to_2d_with_indices(
+                    target_probs, pad_row_indices, pad_col_indices, bs, max_count, pad_value=0.0
                 )
             else:
                 # Uniform case: simple reshape
@@ -615,6 +702,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
             # Map accept_index to selected_scores indices
             # Note: accept_index has PADDED indices when per_request_draft_token_num is set
+            # Convert to CPU once outside the loop to avoid repeated GPU→CPU syncs
+            accept_index_cpu = accept_index.tolist()
             score_offset = 0  # offset into selected_scores (no verified)
             for req_idx in range(bs):
                 num_tokens = tokens_per_req[req_idx]
@@ -625,7 +714,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 else:
                     req_offset = req_idx * self.draft_token_num  # uniform offset
 
-                for idx in accept_index[req_idx].tolist():
+                for idx in accept_index_cpu[req_idx]:
                     if idx == -1:
                         break
                     pos = idx - req_offset  # position within this request
@@ -654,10 +743,20 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             accept_index_ragged = accept_index + offset_diff.to(torch.int32).unsqueeze(1)
             accept_index_ragged[~valid_mask] = -1
             accept_index = accept_index_ragged[accept_index_ragged != -1]  # 1D ragged
+
+            if _TILESPEC_DEBUG:
+                torch.cuda.synchronize()
+                _t_verify_end = time.perf_counter()
+                print(f"[TileSpec] verify() ragged overhead: {(_t_verify_end-_t_verify_start)*1000:.3f}ms (bs={bs})")
         else:
             # Uniform case: padded == ragged, no conversion needed
             accept_index = accept_index[accept_index != -1]
             verified_id = predict[accept_index]
+
+            if _TILESPEC_DEBUG:
+                torch.cuda.synchronize()
+                _t_verify_end = time.perf_counter()
+                print(f"[EAGLE] verify() uniform: {(_t_verify_end-_t_verify_start)*1000:.3f}ms (bs={bs})")
 
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False

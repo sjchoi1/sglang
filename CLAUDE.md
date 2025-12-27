@@ -23,6 +23,27 @@ python -m sglang.launch_server \
     --speculative-draft-model-path meta-llama/Llama-3.1-8B-Instruct
 ```
 
+### Building sgl-kernel
+
+```bash
+cd sgl-kernel
+
+# Default build (uses 32 nvcc threads per file, may OOM on low-memory hosts)
+pip install -e . --no-build-isolation
+
+# Memory-constrained build (recommended for <64GB RAM)
+CMAKE_BUILD_PARALLEL_LEVEL=2 pip install -e . --no-build-isolation -C cmake.define.SGL_KERNEL_COMPILE_THREADS=4
+
+# Minimum memory build (slowest, for very constrained systems)
+CMAKE_BUILD_PARALLEL_LEVEL=1 pip install -e . --no-build-isolation -C cmake.define.SGL_KERNEL_COMPILE_THREADS=1
+```
+
+**Environment variables:**
+- `CMAKE_BUILD_PARALLEL_LEVEL`: Number of .cu files to compile in parallel (default: all cores)
+- `SGL_KERNEL_COMPILE_THREADS`: nvcc `--threads=N` flag per file (default: 32)
+
+Total compiler processes ≈ `CMAKE_BUILD_PARALLEL_LEVEL × SGL_KERNEL_COMPILE_THREADS × ~2-3`
+
 ## Repository Structure
 
 ```

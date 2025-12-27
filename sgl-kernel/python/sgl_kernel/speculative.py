@@ -87,6 +87,42 @@ def build_tree_kernel_efficient(
     )
 
 
+def build_tree_kernel_efficient_ragged(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    token_indptr: torch.Tensor,
+    score_indptr: torch.Tensor,
+    mask_indptr: torch.Tensor,
+    topk: int,
+    depth: int,
+    max_draft_token_num: int,
+    tree_mask_mode: int,
+) -> None:
+    torch.ops.sgl_kernel.build_tree_kernel_efficient_ragged.default(
+        parent_list,
+        selected_index,
+        verified_seq_len,
+        tree_mask,
+        positions,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        token_indptr,
+        score_indptr,
+        mask_indptr,
+        topk,
+        depth,
+        max_draft_token_num,
+        tree_mask_mode,
+    )
+
+
 def reconstruct_indices_from_tree_mask(
     tree_mask: torch.Tensor,
     verified_seq_len: torch.Tensor,

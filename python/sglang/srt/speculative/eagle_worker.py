@@ -534,12 +534,13 @@ class EAGLEWorker(TpModelWorker):
         )
         if can_cuda_graph:
             result = self.cuda_graph_runner.replay(forward_batch)
-            # Handle both 3-value and 5-value outputs from CUDA graph
-            if len(result) == 5:
-                parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores = result
+            # Handle both 3-value and 6-value outputs from CUDA graph
+            if len(result) == 6:
+                parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, sorted_request_ids, selected_scores = result
             else:
                 parent_list, top_scores_index, draft_tokens = result
                 per_request_draft_token_num = None
+                sorted_request_ids = None
                 selected_scores = None
         else:
             forward_batch.can_run_dp_cuda_graph = False
@@ -550,7 +551,7 @@ class EAGLEWorker(TpModelWorker):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
-            parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores = self.draft_forward(
+            parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, sorted_request_ids, selected_scores = self.draft_forward(
                 forward_batch
             )
 
@@ -579,18 +580,11 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
             per_request_draft_token_num=per_request_draft_token_num,
+            sorted_request_ids=sorted_request_ids,
         )
 
-        # Flatten selected_scores for TileSpec calibration
-        if selected_scores is not None:
-            if isinstance(selected_scores, list):
-                # TileSpec ragged case: list of tensors per request
-                selected_scores_flat = torch.cat(selected_scores) if any(s.numel() > 0 for s in selected_scores) else None
-            else:
-                # Uniform case: [bs, n_drafts] tensor
-                selected_scores_flat = selected_scores.flatten()
-        else:
-            selected_scores_flat = None
+        # selected_scores is already 1D flattened from organize_draft_results
+        selected_scores_flat = selected_scores
 
         return EagleVerifyInput(
             draft_token=draft_tokens,
@@ -635,6 +629,13 @@ class EAGLEWorker(TpModelWorker):
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
 
+        # TileSpec state: check if profiling or ragged path enabled
+        is_tilespec_profiling = False
+        use_ragged_path = False
+        if hasattr(self, 'tile_spec_profiler') and self.tile_spec_profiler is not None:
+            is_tilespec_profiling = self.tile_spec_profiler.is_profiling()
+            use_ragged_path = True  # Always use ragged path when TileSpec enabled
+
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
@@ -676,33 +677,25 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-        # Get TileSpec profiling state and latency model
-        is_tilespec_profiling = False
-        latency_model = None
-        if hasattr(self, 'tile_spec_profiler') and self.tile_spec_profiler is not None:
-            is_tilespec_profiling = self.tile_spec_profiler.is_profiling()
-            if not is_tilespec_profiling:
-                # Runtime: get latency model (no calibration needed - scores used directly)
-                latency_model = self.tile_spec_profiler.get_latency_model()
-
         result = organize_draft_results(
             score_list,
             token_list,
             parents_list,
             self.speculative_num_draft_tokens,
-            latency_model=latency_model,
             is_tilespec_profiling=is_tilespec_profiling,
+            use_ragged_path=use_ragged_path,
         )
 
-        # Handle both 3-value (uniform) and 5-value (TileSpec) returns
-        if len(result) == 5:
-            parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores = result
+        # Handle both 3-value (uniform) and 6-value (TileSpec ragged) returns
+        if len(result) == 6:
+            parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, sorted_request_ids, selected_scores = result
         else:
             parent_list, top_scores_index, draft_tokens = result
             per_request_draft_token_num = None
+            sorted_request_ids = None
             selected_scores = None
 
-        return parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, selected_scores
+        return parent_list, top_scores_index, draft_tokens, per_request_draft_token_num, sorted_request_ids, selected_scores
 
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker
@@ -737,9 +730,19 @@ class EAGLEWorker(TpModelWorker):
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
-        torch.cuda.synchronize()
-        verify_end_time = time.perf_counter()
-        verify_latency_ms = (verify_end_time - verify_start_time) * 1000.0
+        # Only sync and record during TileSpec profiling
+        # This avoids blocking the GPU pipeline in production
+        if hasattr(self, 'tile_spec_profiler') and self.tile_spec_profiler is not None and self.tile_spec_profiler.is_profiling():
+            torch.cuda.synchronize()
+            verify_end_time = time.perf_counter()
+            verify_latency_ms = (verify_end_time - verify_start_time) * 1000.0
+            num_tokens = spec_info.draft_token.shape[0] if not batch.forward_mode.is_idle() else 0
+            self.tile_spec_profiler.record(
+                num_tokens=num_tokens,
+                latency_ms=verify_latency_ms,
+                scores=getattr(spec_info, 'selected_scores', None),
+                accepted=getattr(spec_info, '_accepted_mask', None),
+            )
 
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
@@ -795,16 +798,6 @@ class EAGLEWorker(TpModelWorker):
 
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
-
-        # Record TileSpec profiling data
-        if hasattr(self, 'tile_spec_profiler') and self.tile_spec_profiler is not None:
-            num_tokens = spec_info.draft_token.shape[0] if not batch.forward_mode.is_idle() else 0
-            self.tile_spec_profiler.record(
-                num_tokens=num_tokens,
-                latency_ms=verify_latency_ms,
-                scores=getattr(spec_info, 'selected_scores', None),
-                accepted=getattr(spec_info, '_accepted_mask', None),
-            )
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (

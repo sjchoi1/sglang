@@ -1,0 +1,48 @@
+{
+  "settings": {
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "draft": "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B",
+    "data": "/workspace/sglang/tile_spec/question.jsonl",
+    "output": "/workspace/sglang/tile_spec/results_llama-31-8b-instruct_sglang-eagle3-llama31-instruct-8b.json",
+    "categories": [
+      "mt_conv"
+    ],
+    "batch_sizes": [
+      8
+    ],
+    "configs": [
+      "AR",
+      "Eagle3",
+      "Eagle3+TileSpec"
+    ],
+    "port": 30000,
+    "no_cache": false
+  },
+  "results": {
+    "mt_conv": {
+      "8": {
+        "AR": {
+          "tokens": 18354,
+          "time": 44.66217644000426,
+          "throughput": 410.95175969884394,
+          "accept_len": 1.0,
+          "speedup": 1.0
+        },
+        "Eagle3": {
+          "tokens": 18365,
+          "time": 28.442299148999155,
+          "throughput": 645.6932297840008,
+          "accept_len": 2.6662311265969802,
+          "speedup": 1.5712141742796806
+        },
+        "Eagle3+TileSpec": {
+          "tokens": 18351,
+          "time": 30.012393494020216,
+          "throughput": 611.4474010097304,
+          "accept_len": 2.6727352170113603,
+          "speedup": 1.4878812088742843
+        }
+      }
+    }
+  }
+}

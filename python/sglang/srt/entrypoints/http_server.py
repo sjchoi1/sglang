@@ -25,6 +25,7 @@ import os
 import tempfile
 import threading
 import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -455,6 +456,10 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=503)
 
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
+        return Response(status_code=503)
+
+    # Return 503 while TileSpec profiling is in progress
+    if Path("/tmp/.sglang_tile_spec_profiling").exists():
         return Response(status_code=503)
 
     if (
@@ -1630,6 +1635,12 @@ def _execute_server_warmup(
         lambda: requests.post(
             url + "/set_internal_state",
             json={"server_args": {"finish_tile_spec_profiling": True}},
+            headers=headers,
+            timeout=5,
+        ),
+        lambda args_dict: requests.post(
+            url + "/set_internal_state",
+            json={"server_args": args_dict},
             headers=headers,
             timeout=5,
         ),

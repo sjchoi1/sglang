@@ -348,6 +348,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
 
   m.def(
+      "build_tree_kernel_efficient_ragged(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
+      "Tensor! retrive_next_sibling, Tensor token_indptr, Tensor score_indptr, Tensor mask_indptr, "
+      "int topk, int depth, int max_draft_token_num, int tree_mask_mode) -> ()");
+  m.impl("build_tree_kernel_efficient_ragged", torch::kCUDA, &build_tree_kernel_efficient_ragged);
+
+  m.def(
       "segment_packbits(Tensor x, Tensor input_indptr, Tensor output_indptr, Tensor! y, int batch_size, "
       "int cuda_stream) -> ()");
   m.impl("segment_packbits", torch::kCUDA, &segment_packbits);

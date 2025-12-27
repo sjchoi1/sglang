@@ -19,7 +19,7 @@ import time
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -35,8 +35,8 @@ except ImportError:
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
-# Comprehensive batch size sweep for profiling - covers full range 1-64
-WARMUP_BATCH_SIZES = list(range(1, 65))
+# Comprehensive batch size sweep for profiling - covers full range 1-32
+WARMUP_BATCH_SIZES = list(range(1, 33))
 
 # Store original log levels for restoration
 _original_log_levels = {}
@@ -125,6 +125,8 @@ class PiecewiseLinearLatency:
         self.boundaries: List[int] = []
         self.slopes: List[float] = []
         self.intercepts: List[float] = []
+        # Precomputed ratio: L[N+1]/L[N] - 1 for dynamic tree threshold
+        self.ratio: Optional[np.ndarray] = None
         # Cached tensors for vectorized predict_batch
         self._latency_cache: torch.Tensor = None
         self._cache_device: torch.device = None
@@ -183,6 +185,28 @@ class PiecewiseLinearLatency:
 
             self.slopes.append(float(slope))
             self.intercepts.append(float(intercept))
+
+        # Precompute ratio for dynamic tree: L[N+1]/L[N] - 1
+        self._precompute_ratio(max_tokens=512)
+
+    def _precompute_ratio(self, max_tokens: int = 512):
+        """Precompute L[N+1]/L[N] - 1 for all N up to max_tokens."""
+        L = np.array([self.predict(n) for n in range(max_tokens + 2)])
+        # ratio[n] = L[n+1]/L[n] - 1
+        # Avoid division by zero
+        L_safe = np.maximum(L[:-1], 1e-9)
+        self.ratio = L[1:] / L_safe - 1  # [max_tokens + 1]
+
+    def get_ratio(self, n: int) -> float:
+        """Get precomputed L[N+1]/L[N] - 1 for threshold computation."""
+        if self.ratio is None:
+            # Fallback: compute on the fly
+            L_n = self.predict(n)
+            L_n1 = self.predict(n + 1)
+            return L_n1 / max(L_n, 1e-9) - 1
+        if n < len(self.ratio):
+            return float(self.ratio[n])
+        return float(self.ratio[-1])  # Extrapolate with last value
 
     def predict(self, n: int) -> float:
         """Predict latency for n tokens using piecewise linear model."""
@@ -270,6 +294,8 @@ class PiecewiseLinearLatency:
         self.boundaries = data["boundaries"].tolist()
         self.slopes = data["slopes"].tolist()
         self.intercepts = data["intercepts"].tolist()
+        # Precompute ratio for dynamic tree
+        self._precompute_ratio(max_tokens=512)
         # Clear tensor caches (will be recreated on demand)
         self._boundaries_tensors.clear()
         self._slopes_tensors.clear()
@@ -665,6 +691,7 @@ def tile_spec_warmup(
     generate_fn: Callable[[List[str]], None],
     check_ready_fn: Callable[[], bool],
     finish_fn: Callable[[], None],
+    set_state_fn: Optional[Callable[[Dict], None]] = None,
 ):
     """
     Run TileSpec warmup profiling through actual verify() path.
@@ -676,7 +703,14 @@ def tile_spec_warmup(
         generate_fn: Function to send generation requests, signature: (prompts: List[str]) -> None
         check_ready_fn: Function that returns True when profiling is complete
         finish_fn: Function to signal profiling should finish
+        set_state_fn: Function to set server args, signature: (args_dict: Dict) -> None
     """
+    # Clean up stale flag file from crashed/killed previous runs (do this unconditionally)
+    stale_flag = Path("/tmp/.sglang_tile_spec_profiling")
+    if stale_flag.exists():
+        logger.info("TileSpec: Removing stale profiling flag from previous run")
+        stale_flag.unlink(missing_ok=True)
+
     logger.info(f"TileSpec: warmup called, tile_spec={getattr(server_args, 'tile_spec', False)}")
     if not getattr(server_args, 'tile_spec', False):
         logger.info("TileSpec: Skipping warmup (not enabled)")
@@ -692,6 +726,17 @@ def tile_spec_warmup(
     if latency_cache.exists():
         logger.info(f"TileSpec: Cache exists at {latency_cache}, skipping warmup")
         return
+
+    # Temporarily increase max_running_requests for profiling if needed
+    original_max_running_requests = getattr(server_args, 'max_running_requests', None)
+    profiling_max_requests = max(WARMUP_BATCH_SIZES)  # 64
+    if original_max_running_requests is not None and original_max_running_requests < profiling_max_requests:
+        if set_state_fn is not None:
+            logger.info(f"TileSpec: Temporarily increasing max_running_requests from {original_max_running_requests} to {profiling_max_requests} for profiling")
+            try:
+                set_state_fn({"max_running_requests": profiling_max_requests})
+            except Exception as e:
+                logger.warning(f"TileSpec: Failed to increase max_running_requests: {e}")
 
     logger.info("TileSpec: Running warmup profiling...")
     logger.info(f"  Batch sizes: 1 to {len(WARMUP_BATCH_SIZES)} (full sweep)")
@@ -716,13 +761,17 @@ def tile_spec_warmup(
             batch = prompts[idx:idx + batch_size]
             idx = (idx + batch_size) % len(prompts)  # Wrap around if needed
             if not batch:
+                logger.warning(f"TileSpec: Empty batch at batch_size={batch_size}, idx={idx}, breaking")
                 break
             try:
+                logger.info(f"TileSpec: Running batch_size={batch_size}, num_prompts={len(batch)}")
                 generate_fn(batch)
                 total_runs += 1
                 pbar.update(1)
             except Exception as e:
-                logger.warning(f"TileSpec: Warmup batch failed: {e}")
+                logger.warning(f"TileSpec: Warmup batch failed at batch_size={batch_size}: {e}")
+                import traceback
+                traceback.print_exc()
                 pbar.update(1)
 
         pbar.close()
@@ -745,7 +794,16 @@ def tile_spec_warmup(
         try:
             if check_ready_fn():
                 logger.info("TileSpec: Profiling complete")
-                return
+                break
         except Exception as e:
             logger.warning(f"TileSpec: check_ready_fn() failed: {e}")
         time.sleep(1.0)
+
+    # Restore original max_running_requests after profiling
+    if original_max_running_requests is not None and original_max_running_requests < profiling_max_requests:
+        if set_state_fn is not None:
+            logger.info(f"TileSpec: Restoring max_running_requests to {original_max_running_requests}")
+            try:
+                set_state_fn({"max_running_requests": original_max_running_requests})
+            except Exception as e:
+                logger.warning(f"TileSpec: Failed to restore max_running_requests: {e}")
